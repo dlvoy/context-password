@@ -3,6 +3,53 @@ development/*
 
 # Rust build output
 /target/
+/xtask/target/
 
 # ad hoc debug logs
 *.log
+PS C:\DEVEL\Desktop\projects\context-password> cargo bundle
+
+=== Building the release binary ===
+> cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.61s
+
+=== Building the MSI ===
+> cargo wix --nocapture -L -sice:ICE69
+    Finished `release` profile [optimized] target(s) in 0.51s
+Windows Installer XML Toolset Compiler version 3.14.1.8722
+Copyright (c) .NET Foundation and contributors. All rights reserved.
+
+main.wxs
+Windows Installer XML Toolset Linker version 3.14.1.8722
+Copyright (c) .NET Foundation and contributors. All rights reserved.
+
+
+=== Building the NSIS installer ===
+> makensis /DPRODUCT_VERSION=0.1.0 packaging/installer.nsi
+Command line defined: "PRODUCT_VERSION=0.1.0"
+Processing config: C:\Program Files (x86)\NSIS\nsisconf.nsh
+Processing script file: "packaging/installer.nsi" (ACP)
+
+Processed 1 file, writing output (x86-unicode):
+warning 9100: Generating version information for language "1033-English" without standard key "FileDescription"
+
+Output: "C:\DEVEL\Desktop\projects\context-password\target\release\ContextPassword-0.1.0-x64-setup.exe"
+Install: 5 pages (320 bytes), 1 section (2072 bytes), 433 instructions (12124 bytes), 209 strings (9622 bytes), 1 language table (322 bytes).
+Uninstall: 2 pages (192 bytes), 1 section (2072 bytes), 57 instructions (1596 bytes), 103 strings (3084 bytes), 1 language table (250 bytes).
+Datablock optimizer saved 1888 bytes (~0.0%).
+
+Using zlib compression.
+
+EXE header size:               78848 / 39936 bytes
+Install code:                   4863 / 24924 bytes
+Install data:                2688776 / 5923148 bytes
+Uninstall code+data:           40290 / 40857 bytes
+CRC (0x68271C2A):                  4 / 4 bytes
+
+Total size:                  2812781 / 6028869 bytes (46.6%)
+
+1 warning:
+  9100: Generating version information for language "1033-English" without standard key "FileDescription"
+
+Done. target\release\context-password.exe, target\wix\*.msi, target\release\ContextPassword-0.1.0-x64-setup.exe
+PS C:\DEVEL\Desktop\projects\context-password>

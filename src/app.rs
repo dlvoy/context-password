@@ -68,6 +68,9 @@ const POPUP_SIZE: (i32, i32) = (340, 220);
 // dialog's scaled-up font size (`config_window::FONT_SCALE`) with no
 // clipping or crowding.
 const SETTINGS_SIZE: (i32, i32) = (460, 420);
+/// Wider than Settings — the license text needs room to stay readable
+/// without wrapping every line down to a couple of words.
+const ABOUT_SIZE: (i32, i32) = (830, 480);
 /// Bounds for the `ShowingList` popup's content-fitted width (see
 /// `measure_list_width`) — never narrower than the other screens, and never
 /// so wide that one absurdly long item name blows the popup up.
@@ -166,6 +169,10 @@ enum Content {
     /// Settings into the existing show/hide machinery sidesteps the bug
     /// entirely instead of working around eframe internals.
     Settings(config_window::ConfigWindowState),
+    /// The About screen: version, license, copyright — read-only, no state
+    /// to carry, so a unit variant is enough. Same same-window-not-a-
+    /// separate-viewport reasoning as `Settings` above.
+    About,
 }
 
 /// Which field Enter/a digit delivers, driven by which modifier is held.
@@ -321,10 +328,11 @@ impl App {
         hotkey: Hotkey,
         cfg: Config,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let hwnd = win::window_style::hwnd_of(cc)
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+        let hwnd = win::window_style::hwnd_of(cc).ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
                 "failed to obtain the native window handle".into()
-            })?;
+            },
+        )?;
         win::window_style::make_tool_window(hwnd);
 
         // `ThemePreference::System` is egui's default already, so this is
@@ -355,6 +363,8 @@ impl App {
                     TrayCmd::Lock
                 } else if event.id() == tray::SETTINGS_ID {
                     TrayCmd::Settings
+                } else if event.id() == tray::ABOUT_ID {
+                    TrayCmd::About
                 } else if event.id() == tray::QUIT_ID {
                     TrayCmd::Quit
                 } else {
@@ -450,7 +460,10 @@ impl App {
         }
         self.popup.target = target;
         self.popup.content = match (&self.cached_entries, &self.popup.content) {
-            (Some(_), _) => Content::ShowingList { selected: 0, message: None },
+            (Some(_), _) => Content::ShowingList {
+                selected: 0,
+                message: None,
+            },
             // An unlock (or lock) submitted before the popup was last
             // dismissed may still be in flight on the worker thread —
             // resume showing the spinner instead of discarding that state
@@ -482,13 +495,14 @@ impl App {
         // Zeroize a half-typed password immediately on dismiss rather than
         // waiting for the next `open_popup` to overwrite (and so drop) it —
         // no reason for it to sit in memory for however long the popup
-        // happens to stay closed (plan §8's zeroize audit, M8). Settings
-        // must be reset here too: `open_popup` refuses to run at all while
-        // `self.popup.content` is `Content::Settings` (so a stray hotkey
-        // press can't clobber an in-progress edit) — leaving it as
-        // `Settings` after hiding would permanently lock the popup out of
-        // ever reopening as the prompt/list again.
-        if matches!(self.popup.content, Content::Prompting { .. } | Content::Settings(_)) {
+        // happens to stay closed (plan §8's zeroize audit, M8). Settings and
+        // About get the same eager reset for consistency, even though
+        // `open_popup`'s own content-decision match would overwrite either
+        // anyway on the next open (it's keyed on `phase`, not `content`).
+        if matches!(
+            self.popup.content,
+            Content::Prompting { .. } | Content::Settings(_) | Content::About
+        ) {
             self.popup.content = PopupState::fresh_prompt();
         }
     }
@@ -534,7 +548,10 @@ impl App {
                 self.cached_entries = Some((entries, dropped));
                 self.set_vault_state(VaultState::Unlocked);
                 if matches!(self.popup.content, Content::Unlocking) {
-                    self.popup.content = Content::ShowingList { selected: 0, message: None };
+                    self.popup.content = Content::ShowingList {
+                        selected: 0,
+                        message: None,
+                    };
                     if self.popup.phase == ShowPhase::Shown {
                         // The window is already placed/sized for the
                         // smaller Prompting/Unlocking screen — re-enter
@@ -598,7 +615,10 @@ impl App {
                 // `ShowingList`) — reset it here first, or it would stay
                 // `FetchingOtp` forever, which `open_popup` treats the same
                 // as `Settings`: refuses to ever reopen the popup again.
-                self.popup.content = Content::ShowingList { selected, message: None };
+                self.popup.content = Content::ShowingList {
+                    selected,
+                    message: None,
+                };
                 self.begin_delivery(target, code, &log_line);
             }
         }
@@ -698,7 +718,9 @@ impl App {
         let mut action = Action::None;
 
         match &mut self.popup.content {
-            Content::Prompting { password, error, .. } => {
+            Content::Prompting {
+                password, error, ..
+            } => {
                 ctx.input(|i| {
                     for event in &i.events {
                         match event {
@@ -794,6 +816,9 @@ impl App {
             // hotkey recorder's key capture), which `update_shown` — called
             // from `logic()` — doesn't have.
             Content::Settings(_) => {}
+            // Same reasoning — Close/Escape are read directly in
+            // `ui::about::draw`.
+            Content::About => {}
         }
 
         match action {
@@ -805,7 +830,10 @@ impl App {
             }
             Action::Deliver(kind) => self.start_delivery(kind),
             Action::BackToList(selected) => {
-                self.popup.content = Content::ShowingList { selected, message: None };
+                self.popup.content = Content::ShowingList {
+                    selected,
+                    message: None,
+                };
             }
         }
     }
@@ -845,7 +873,10 @@ impl App {
             }
             DeliveryKind::Otp => {
                 if !entry.has_totp {
-                    self.set_list_message(selected, "This item has no TOTP configured.".to_string());
+                    self.set_list_message(
+                        selected,
+                        "This item has no TOTP configured.".to_string(),
+                    );
                     return;
                 }
                 let item_id = entry.id.clone();
@@ -860,7 +891,10 @@ impl App {
     /// OTP) can't be delivered, per the settled decision to say so rather
     /// than silently falling back to the password.
     fn set_list_message(&mut self, selected: usize, message: String) {
-        self.popup.content = Content::ShowingList { selected, message: Some(message) };
+        self.popup.content = Content::ShowingList {
+            selected,
+            message: Some(message),
+        };
     }
 
     /// The common tail of every delivery kind once its secret is in hand:
@@ -914,6 +948,18 @@ impl App {
         self.popup.phase = ShowPhase::Placing;
     }
 
+    /// Opens the About screen — same reasoning and same no-cursor-context
+    /// centering as `open_settings`, minus any state to seed since there's
+    /// nothing to edit.
+    fn open_about(&mut self) {
+        if self.delivery.is_some() {
+            return;
+        }
+        self.popup.target = None;
+        self.popup.content = Content::About;
+        self.popup.phase = ShowPhase::Placing;
+    }
+
     /// Applies whichever of the hotkey/autostart actually changed, saves
     /// the config, and reports the first failure (if any) rather than
     /// silently discarding it — but still applies whatever *did* succeed
@@ -939,7 +985,11 @@ impl App {
                 Ok(()) => {
                     eprintln!(
                         "settings: autostart {}",
-                        if state.autostart { "enabled" } else { "disabled" }
+                        if state.autostart {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
                     );
                     self.cfg.autostart = state.autostart;
                 }
@@ -953,8 +1003,11 @@ impl App {
         // next launch only: the delayed-unlock timer (if any) was already
         // spawned in `App::new` for this session and has no way to learn
         // the setting changed underneath it.
-        let new_unlock_mode =
-            if state.auto_unlock { UnlockMode::Delayed } else { UnlockMode::Lazy };
+        let new_unlock_mode = if state.auto_unlock {
+            UnlockMode::Delayed
+        } else {
+            UnlockMode::Lazy
+        };
         if new_unlock_mode != self.cfg.unlock_mode {
             eprintln!("settings: auto-unlock at start {}", state.auto_unlock);
             self.cfg.unlock_mode = new_unlock_mode;
@@ -962,13 +1015,18 @@ impl App {
         if state.lock_on_exit != self.cfg.lock_on_exit {
             eprintln!(
                 "settings: lock on exit {}",
-                if state.lock_on_exit { "enabled" } else { "disabled" }
+                if state.lock_on_exit {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             );
             self.cfg.lock_on_exit = state.lock_on_exit;
         }
-        let clamped_max_visible = state
-            .max_visible_items
-            .clamp(crate::config::MIN_VISIBLE_ITEMS, crate::config::MAX_VISIBLE_ITEMS);
+        let clamped_max_visible = state.max_visible_items.clamp(
+            crate::config::MIN_VISIBLE_ITEMS,
+            crate::config::MAX_VISIBLE_ITEMS,
+        );
         if clamped_max_visible != self.cfg.max_visible_items {
             eprintln!("settings: max visible items changed to {clamped_max_visible}");
             self.cfg.max_visible_items = clamped_max_visible;
@@ -1018,6 +1076,7 @@ impl eframe::App for App {
                 }
                 Msg::Tray(TrayCmd::Lock) => self.handle_lock(),
                 Msg::Tray(TrayCmd::Settings) => self.open_settings(),
+                Msg::Tray(TrayCmd::About) => self.open_about(),
                 Msg::Hotkey(target) => self.open_popup(Some(target)),
                 Msg::Bw(result) => self.handle_bw_result(result),
             }
@@ -1032,7 +1091,10 @@ impl eframe::App for App {
         match self.exit_state {
             ExitState::NotExiting => {
                 let close_requested = ctx.input(|i| i.viewport().close_requested());
-                if close_requested && self.cfg.lock_on_exit && self.vault_state == VaultState::Unlocked {
+                if close_requested
+                    && self.cfg.lock_on_exit
+                    && self.vault_state == VaultState::Unlocked
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     self.handle_lock();
                     self.exit_state = ExitState::WaitingForLock {
@@ -1060,6 +1122,7 @@ impl eframe::App for App {
                     // Needs more room than the item list for the hotkey
                     // recorder, checkbox, and buttons.
                     Content::Settings(_) => SETTINGS_SIZE,
+                    Content::About => ABOUT_SIZE,
                     Content::ShowingList { .. } => {
                         let max_visible = self.cfg.effective_max_visible();
                         let width = self.cached_entries.as_ref().map_or(POPUP_SIZE.0, |(e, _)| {
@@ -1131,7 +1194,11 @@ impl eframe::App for App {
         let mut post_action = None;
 
         match &mut self.popup.content {
-            Content::Prompting { password, error, revealed } => {
+            Content::Prompting {
+                password,
+                error,
+                revealed,
+            } => {
                 if crate::ui::popup::prompting(ui, password, *revealed, error.as_deref()) {
                     *revealed = !*revealed;
                 }
@@ -1204,6 +1271,11 @@ impl eframe::App for App {
                         }
                         post_action = Some(PostAction::Save(state.clone()));
                     }
+                }
+            }
+            Content::About => {
+                if crate::ui::about::draw(ui) {
+                    post_action = Some(PostAction::Hide);
                 }
             }
         }

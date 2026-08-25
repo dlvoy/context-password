@@ -1,0 +1,5 @@
+# `cargo bundle` builds the release binary and both Windows installers in
+# one shot — see xtask/src/main.rs. `xtask` is a separate crate (not a
+# workspace member), so this never affects the main project's own build.
+[alias]
+bundle = ["run", "--manifest-path", "xtask/Cargo.toml", "--quiet", "--"]

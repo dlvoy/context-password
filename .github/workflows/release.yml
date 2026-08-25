@@ -1,0 +1,159 @@
+name: Release
+
+# Production builds run only for version tags. Pushing to a branch never
+# publishes anything; use the manual trigger to exercise the build itself.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Never cancel a release build half-way through — a partly uploaded
+  # release is worse than a slow one.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            # Manual run: nothing is published, so take the version from the
+            # manifest just to name the artifacts.
+            version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+          # A tag like v1.1.0-rc.1 publishes as a pre-release.
+          if [ "${GITHUB_REF_NAME}" != "${GITHUB_REF_NAME%-*}" ]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # The installers take their version from Cargo.toml, not from the
+      # tag. If those drift, the release ships artifacts labelled with the
+      # wrong version, so stop before spending time on the build.
+      - name: Check the tag matches Cargo.toml
+        if: steps.meta.outputs.release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="${{ steps.meta.outputs.version }}"
+          got="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$got" != "$want" ]; then
+            echo "::error file=Cargo.toml::Cargo.toml is at ${got}, but the tag says ${want}"
+            echo "Bump Cargo.toml to ${want}, commit, then move the tag."
+            exit 1
+          fi
+          echo "ok  Cargo.toml = ${got}"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # One cache for the whole workflow rather than one per tag.
+          shared-key: windows-release
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked
+
+      # cargo-wix finds candle/light via the WIX environment variable, and
+      # the chocolatey package shims `makensis` straight onto PATH — neither
+      # needs its install path guessed.
+      - name: Install WiX Toolset
+        run: choco install wixtoolset -y --no-progress
+
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+
+      # Builds the release binary, then the MSI, then the NSIS installer —
+      # see xtask/src/main.rs. Reads the version straight from Cargo.toml,
+      # already checked against the tag above.
+      - name: Build everything
+        run: cargo bundle
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          version="${{ steps.meta.outputs.version }}"
+          mkdir -p release
+
+          # Globs are scoped to this version rather than left open, so a
+          # leftover build from an earlier run can't silently slip in.
+          pick() {
+            local label="$1"; shift
+            if [ "$#" -ne 1 ]; then
+              echo "::error::expected exactly one ${label} for ${version}, found $#: $*" >&2
+              return 1
+            fi
+            printf '%s\n' "$1"
+          }
+
+          msi="$(pick 'MSI package' target/wix/*.msi)"
+          nsis="$(pick 'NSIS installer' "target/release/ContextPassword-${version}-x64-setup.exe")"
+
+          cp target/release/context-password.exe \
+             "release/ContextPassword-${version}-x64-portable.exe"
+          cp "$nsis" "release/ContextPassword-${version}-x64-setup.exe"
+          cp "$msi"  "release/ContextPassword-${version}-x64.msi"
+
+          cd release
+          sha256sum ./*.exe ./*.msi | sed 's|\./||' > checksums.txt
+          ls -lh
+          cat checksums.txt
+
+      - name: Assemble release notes
+        if: steps.meta.outputs.release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/release-notes.sh "${{ steps.meta.outputs.version }}" > notes.md
+          echo "--- release notes ---"
+          cat notes.md
+
+      # Uploaded even on a manual run, so a build can be checked without
+      # publishing anything.
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: context-password-${{ steps.meta.outputs.version }}-windows-x64
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish the release
+        if: steps.meta.outputs.release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Context Password for Bitwarden ${{ steps.meta.outputs.version }}
+          body_path: notes.md
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            release/ContextPassword-${{ steps.meta.outputs.version }}-x64-setup.exe
+            release/ContextPassword-${{ steps.meta.outputs.version }}-x64-portable.exe
+            release/ContextPassword-${{ steps.meta.outputs.version }}-x64.msi
+            release/checksums.txt

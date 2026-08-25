@@ -27,6 +27,7 @@ pub enum TrayCmd {
     /// the password prompt immediately.
     Lock,
     Settings,
+    About,
     Quit,
 }
 

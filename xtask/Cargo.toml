@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Deliberately no dependencies — this only shells out to `cargo`, `cargo
+# wix`, and `makensis`, and reads one line out of Cargo.toml by hand. Not
+# part of the main project's workspace (there isn't one): a completely
+# separate manifest so it can never affect `context-password`'s own build,
+# lints, or dependency tree.
+[dependencies]

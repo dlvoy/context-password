@@ -16,6 +16,8 @@ pub const SHOW_ID: &str = "show";
 pub const LOCK_ID: &str = "lock";
 /// Opens the settings window.
 pub const SETTINGS_ID: &str = "settings";
+/// Opens the About screen.
+pub const ABOUT_ID: &str = "about";
 pub const QUIT_ID: &str = "quit";
 
 /// The tray icon plus handles to its menu items, kept alive and mutable for
@@ -61,6 +63,7 @@ pub fn build() -> tray_icon::Result<TrayHandles> {
     let show = MenuItem::with_id(SHOW_ID, "Show", true, None);
     let lock = MenuItem::with_id(LOCK_ID, "Lock", true, None);
     let settings = MenuItem::with_id(SETTINGS_ID, "Settings…", true, None);
+    let about = MenuItem::with_id(ABOUT_ID, "About…", true, None);
     let quit = MenuItem::with_id(QUIT_ID, "Quit", true, None);
 
     let append = |item: &dyn tray_icon::menu::IsMenuItem| {
@@ -71,6 +74,7 @@ pub fn build() -> tray_icon::Result<TrayHandles> {
     append(&lock);
     append(&PredefinedMenuItem::separator());
     append(&settings);
+    append(&about);
     append(&PredefinedMenuItem::separator());
     append(&quit);
 
@@ -80,8 +84,8 @@ pub fn build() -> tray_icon::Result<TrayHandles> {
     // reflected immediately without calling `TrayIcon::set_menu` again.
     let icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu.clone()))
-        .with_icon(placeholder_icon())
-        .with_tooltip("context-password")
+        .with_icon(tray_icon_image())
+        .with_tooltip("Context Password for Bitwarden")
         .build()?;
 
     Ok(TrayHandles {
@@ -93,13 +97,11 @@ pub fn build() -> tray_icon::Result<TrayHandles> {
     })
 }
 
-/// A solid placeholder glyph until a real icon is designed. 16x16 keeps the
-/// tray crisp at 100% scaling; Windows scales it up itself at higher DPI.
-fn placeholder_icon() -> Icon {
-    const SIZE: u32 = 16;
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for _ in 0..(SIZE * SIZE) {
-        rgba.extend_from_slice(&[0x6a, 0x3d, 0xd1, 0xff]); // solid violet
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("a solid 16x16 RGBA buffer is always a valid icon")
+/// The app's logo (`development/logo.png`, regenerated via
+/// `resources/generate-icons.ps1`), embedded as a raw 32x32 RGBA buffer —
+/// no runtime PNG-decoding dependency needed for a single fixed-size image.
+fn tray_icon_image() -> Icon {
+    const SIZE: u32 = 32;
+    let rgba = include_bytes!("../resources/tray_icon.rgba").to_vec();
+    Icon::from_rgba(rgba, SIZE, SIZE).expect("resources/tray_icon.rgba is a 32x32 RGBA buffer")
 }

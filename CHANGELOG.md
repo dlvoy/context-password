@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-25
+
 ### Added
 
+- A proper application and tray icon, based on the project's logo.
+- An About screen, from the tray, showing the app's version, license, and copyright.
+- A LICENSE file (MIT), with the full text also shown in the About screen.
+- Prebuilt Windows installers (MSI and NSIS), each with a desktop shortcut and a launch-after-install option, both on by default.
+- README and BUILDING documentation, including how to set up the Bitwarden CLI and tag vault items so they show up in the popup.
+- A GitHub Actions workflow that builds and publishes releases from a version tag.
 - A system tray icon with a Show and a Quit menu item.
 - A configurable global hotkey (default Ctrl+Alt+V) that pops up a small window at the mouse cursor and takes keyboard focus.
 - Pressing Escape dismisses the popup and returns focus to whatever was focused before it appeared.
