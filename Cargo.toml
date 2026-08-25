@@ -1,6 +1,6 @@
 [package]
 name = "context-password"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Global-hotkey popup that auto-types Bitwarden passwords via the bw CLI"
 authors = ["Dominik Dzienia"]

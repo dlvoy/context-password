@@ -84,8 +84,16 @@ jobs:
       - name: Install WiX Toolset
         run: choco install wixtoolset -y --no-progress
 
+      # The chocolatey package installs makensis, but a mid-job PATH change
+      # from an installer isn't visible to later steps on the GitHub-hosted
+      # Windows runner unless it's added to $GITHUB_PATH explicitly (the
+      # runner's steps don't re-read the registry between steps the way an
+      # interactive shell with `refreshenv` would).
       - name: Install NSIS
-        run: choco install nsis -y --no-progress
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files (x86)\NSIS"
 
       # Builds the release binary, then the MSI, then the NSIS installer —
       # see xtask/src/main.rs. Reads the version straight from Cargo.toml,

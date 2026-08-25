@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-25
+
+### Fixed
+
+- The release workflow's NSIS installer build, which failed to find `makensis` right after installing it.
+
 ## [1.0.0] - 2026-08-25
 
 ### Added
