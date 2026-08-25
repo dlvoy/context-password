@@ -1,0 +1,4 @@
+// CREATEPROCESS_MANIFEST_RESOURCE_ID (1), RT_MANIFEST (24).
+// Declares PerMonitorV2 DPI awareness and asInvoker execution level so
+// Windows applies them before any window is created.
+1 24 "app.manifest"

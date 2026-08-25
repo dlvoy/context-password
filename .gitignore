@@ -1,2 +1,8 @@
 # internal docs and idea documentation
 development/*
+
+# Rust build output
+/target/
+
+# ad hoc debug logs
+*.log
