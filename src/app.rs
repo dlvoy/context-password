@@ -14,12 +14,21 @@
 //! M4 added the `bw` worker (headless): unlock → sync → list on a
 //! background thread.
 //!
-//! M5 wires it all together into the real popup (plan §1/§9): `Prompting`
+//! M5 wired it all together into the real popup (plan §1/§9): `Prompting`
 //! (a password field that never touches `egui::TextEdit`, per F6),
 //! `Unlocking`, and `ShowingList` with keyboard/mouse selection, feeding
 //! real passwords into the M3 delivery machine instead of a hardcoded
-//! payload. This is the first fully working flow end to end.
+//! payload — the first fully working flow end to end. M6 added
+//! monitor-aware flip-and-clamp placement.
+//!
+//! M7 adds the settings screen (`ui::config_window`) — `Content::Settings`,
+//! a screen in the same popup window rather than a separate viewport (see
+//! that variant's doc for why) — with a hotkey recorder and the autostart
+//! toggle, both applied live (re-registering the hotkey without a
+//! restart). It also adds the tray's Lock item: forgets the cached items
+//! and the worker's session key, and tells `bw` to lock too.
 
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -31,6 +40,8 @@ use crate::config::{Config, UnlockMode};
 use crate::hotkey::Hotkey;
 use crate::msg::{BwCmd, BwResult, Msg, TrayCmd};
 use crate::secret::Secret;
+use crate::ui::config_window;
+use crate::ui::config_window::ConfigWindowState;
 use crate::win::focus::{self, ActivationResult, Target};
 use crate::{bw, tray, win};
 
@@ -44,6 +55,7 @@ const FOREGROUND_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
 /// cadence — total delivery latency is a few hundred ms, not a few ms.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const POPUP_SIZE: (i32, i32) = (340, 220);
+const SETTINGS_SIZE: (i32, i32) = (380, 300);
 
 /// The popup's show/hide state — window mechanics, independent of what's
 /// displayed once shown (`Content`, below). `Placing`/`Showing`/`Activating`
@@ -68,6 +80,15 @@ enum Content {
     ShowingList {
         selected: usize,
     },
+    /// The settings screen (M7). A screen within the *same* popup window
+    /// rather than a separate child viewport: `show_viewport_immediate`
+    /// panics when called while the root viewport is hidden (which is
+    /// exactly when the tray's Settings item opens it) — eframe's glow
+    /// backend can't upgrade the `Weak` GL-context references it needs on
+    /// that code path, so the render callback silently never runs. Folding
+    /// Settings into the existing show/hide machinery sidesteps the bug
+    /// entirely instead of working around eframe internals.
+    Settings(config_window::ConfigWindowState),
 }
 
 struct PopupState {
@@ -139,7 +160,7 @@ pub struct App {
     // shell; nothing here depends on drop order otherwise, but keep it
     // explicit rather than relying on field order being incidental.
     _tray: tray_icon::TrayIcon,
-    _hotkey: Hotkey,
+    hotkey: Hotkey,
     hwnd: windows_sys::Win32::Foundation::HWND,
     cfg: Config,
     rx: Receiver<Msg>,
@@ -153,6 +174,12 @@ pub struct App {
     /// section). `None` means "never unlocked yet" and is what routes the
     /// popup to `Prompting` instead of `ShowingList`.
     cached_entries: Option<(Vec<Entry>, usize)>,
+    /// Set while the Settings screen has temporarily unregistered the live
+    /// hotkey so it can be re-captured (see `Hotkey::suspend`) — tracked
+    /// here rather than derived from `ConfigWindowState.recording` so the
+    /// registration is guaranteed to be restored even if the screen closes
+    /// mid-recording.
+    hotkey_suspended: bool,
 }
 
 impl App {
@@ -191,6 +218,10 @@ impl App {
             move |event: tray_icon::menu::MenuEvent| {
                 let cmd = if event.id() == tray::SHOW_ID {
                     TrayCmd::Show
+                } else if event.id() == tray::LOCK_ID {
+                    TrayCmd::Lock
+                } else if event.id() == tray::SETTINGS_ID {
+                    TrayCmd::Settings
                 } else if event.id() == tray::QUIT_ID {
                     TrayCmd::Quit
                 } else {
@@ -203,10 +234,14 @@ impl App {
 
         let hotkey_tx = tx.clone();
         let hotkey_ctx = cc.egui_ctx.clone();
-        let hotkey_id = hotkey.id();
+        // A handle, not a copied `u32`: `Hotkey::set` (M7's live
+        // re-registration) changes the id underneath this 'static closure,
+        // which has no other way to learn about it.
+        let hotkey_id = hotkey.id_handle();
         global_hotkey::GlobalHotKeyEvent::set_event_handler(Some(
             move |event: global_hotkey::GlobalHotKeyEvent| {
-                if event.id() != hotkey_id || event.state() != global_hotkey::HotKeyState::Pressed
+                if event.id() != hotkey_id.load(Ordering::Relaxed)
+                    || event.state() != global_hotkey::HotKeyState::Pressed
                 {
                     return;
                 }
@@ -239,7 +274,7 @@ impl App {
 
         Ok(Self {
             _tray,
-            _hotkey: hotkey,
+            hotkey,
             hwnd,
             cfg,
             rx,
@@ -254,6 +289,7 @@ impl App {
             delivery: None,
             stats: ActivationStats::default(),
             cached_entries: None,
+            hotkey_suspended: false,
         })
     }
 
@@ -261,8 +297,11 @@ impl App {
     /// path, with no cursor context). Content is decided once, here, from
     /// whichever cache state currently holds — not re-decided every frame.
     fn open_popup(&mut self, target: Option<Target>) {
-        if self.delivery.is_some() {
-            // Never interrupt a delivery already in flight.
+        if self.delivery.is_some() || matches!(self.popup.content, Content::Settings(_)) {
+            // Never interrupt a delivery already in flight, or a Settings
+            // screen the user has open — a stray tray "Show" or (while a
+            // hotkey change is mid-edit) even the live hotkey firing should
+            // not silently discard an in-progress edit.
             return;
         }
         self.popup.target = target;
@@ -286,20 +325,49 @@ impl App {
         }
         self.popup.phase = ShowPhase::Hidden;
         self.popup.seen_focus = false;
+        // Zeroize a half-typed password immediately on dismiss rather than
+        // waiting for the next `open_popup` to overwrite (and so drop) it —
+        // no reason for it to sit in memory for however long the popup
+        // happens to stay closed (plan §8's zeroize audit, M8). Settings
+        // must be reset here too: `open_popup` refuses to run at all while
+        // `self.popup.content` is `Content::Settings` (so a stray hotkey
+        // press can't clobber an in-progress edit) — leaving it as
+        // `Settings` after hiding would permanently lock the popup out of
+        // ever reopening as the prompt/list again.
+        if matches!(self.popup.content, Content::Prompting { .. } | Content::Settings(_)) {
+            self.popup.content = PopupState::fresh_prompt();
+        }
+    }
+
+    /// Forgets everything the app currently has unlocked: the cached items
+    /// (and their passwords, zeroized on drop), and — via the worker — its
+    /// own session key and the CLI's, best-effort. If the popup is open and
+    /// showing the item list, it snaps back to the password prompt right
+    /// away rather than continuing to show a list that's no longer valid.
+    fn handle_lock(&mut self) {
+        eprintln!("lock: clearing cached items and locking the vault");
+        self.cached_entries = None;
+        if matches!(self.popup.content, Content::ShowingList { .. }) {
+            self.popup.content = PopupState::fresh_prompt();
+        }
+        let _ = self.bw_cmd_tx.send(BwCmd::Lock);
     }
 
     /// The only place `bw` worker results reach stderr — names and ORDs
-    /// only, per `Entry::log_line`, never a password — and where they feed
+    /// only, per `Entry::log_line`, never a password (and only at all when
+    /// `debug_log` is on — plan §8's log review, M8) — and where they feed
     /// back into the popup if it's waiting on them.
     fn handle_bw_result(&mut self, result: BwResult) {
         match result {
             BwResult::Items { entries, dropped } => {
-                eprintln!(
-                    "bw: unlocked, {} item(s) matched, {dropped} dropped",
-                    entries.len()
-                );
-                for entry in &entries {
-                    eprintln!("  {}", entry.log_line());
+                if self.cfg.debug_log {
+                    eprintln!(
+                        "bw: unlocked, {} item(s) matched, {dropped} dropped",
+                        entries.len()
+                    );
+                    for entry in &entries {
+                        eprintln!("  {}", entry.log_line());
+                    }
                 }
                 self.cached_entries = Some((entries, dropped));
                 if matches!(self.popup.content, Content::Unlocking) {
@@ -474,6 +542,11 @@ impl App {
                     action = Action::Hide;
                 }
             }
+            // Handled entirely in `ui()` instead: the settings screen needs
+            // a `Ui` to draw and to read its own input (button clicks, the
+            // hotkey recorder's key capture), which `update_shown` — called
+            // from `logic()` — doesn't have.
+            Content::Settings(_) => {}
         }
 
         match action {
@@ -502,11 +575,12 @@ impl App {
         };
 
         eprintln!(
-            "delivery: starting for target hwnd={} (elevated_beyond_us={}), item={}",
-            target.hwnd,
-            target.elevated_beyond_us,
-            entry.log_line()
+            "delivery: starting for target hwnd={} (elevated_beyond_us={})",
+            target.hwnd, target.elevated_beyond_us
         );
+        if self.cfg.debug_log {
+            eprintln!("delivery: item {}", entry.log_line());
+        }
         self.delivery = Some(Delivery {
             target,
             secret: entry.password.clone_secret(),
@@ -515,6 +589,70 @@ impl App {
         });
         self.popup.phase = ShowPhase::Hidden;
         self.popup.seen_focus = false;
+    }
+
+    /// Opens the settings screen in the same popup window (see
+    /// `Content::Settings`'s doc for why not a separate viewport), seeded
+    /// from the live config and the autostart registry's actual current
+    /// state — not the config file's belief about it, since the user may
+    /// have removed it via Task Manager's Startup tab since we last wrote
+    /// it. No cursor context, so it centers on the primary monitor, same
+    /// as the tray's Show item.
+    fn open_settings(&mut self) {
+        if self.delivery.is_some() {
+            return;
+        }
+        self.popup.target = None;
+        self.popup.content = Content::Settings(ConfigWindowState {
+            hotkey_spec: self.hotkey.spec(),
+            recording: false,
+            autostart: win::autostart::is_enabled(),
+            message: None,
+            held: config_window::HeldMods::default(),
+        });
+        self.popup.phase = ShowPhase::Placing;
+    }
+
+    /// Applies whichever of the hotkey/autostart actually changed, saves
+    /// the config, and reports the first failure (if any) rather than
+    /// silently discarding it — but still applies whatever *did* succeed
+    /// rather than requiring all-or-nothing, since a failed autostart
+    /// toggle is no reason to also refuse a valid hotkey change.
+    fn try_apply_config_window(&mut self, state: &ConfigWindowState) -> Result<(), String> {
+        let mut error = None;
+
+        if state.hotkey_spec != self.cfg.hotkey {
+            match self.hotkey.set(&state.hotkey_spec) {
+                Ok(()) => {
+                    eprintln!("settings: hotkey changed to {}", state.hotkey_spec);
+                    self.cfg.hotkey.clone_from(&state.hotkey_spec);
+                }
+                Err(e) => {
+                    error = Some(format!("hotkey: {e}"));
+                }
+            }
+        }
+
+        if state.autostart != self.cfg.autostart {
+            match win::autostart::set_enabled(state.autostart) {
+                Ok(()) => {
+                    eprintln!(
+                        "settings: autostart {}",
+                        if state.autostart { "enabled" } else { "disabled" }
+                    );
+                    self.cfg.autostart = state.autostart;
+                }
+                Err(e) => {
+                    error.get_or_insert(format!("autostart: {e}"));
+                }
+            }
+        }
+
+        if let Err(e) = self.cfg.save() {
+            error.get_or_insert(format!("saving config: {e}"));
+        }
+
+        error.map_or(Ok(()), Err)
     }
 }
 
@@ -552,6 +690,8 @@ impl eframe::App for App {
                 Msg::Tray(TrayCmd::Show) | Msg::ShowPopup => {
                     self.open_popup(None);
                 }
+                Msg::Tray(TrayCmd::Lock) => self.handle_lock(),
+                Msg::Tray(TrayCmd::Settings) => self.open_settings(),
                 Msg::Hotkey(target) => self.open_popup(Some(target)),
                 Msg::Bw(result) => self.handle_bw_result(result),
             }
@@ -560,7 +700,12 @@ impl eframe::App for App {
         match self.popup.phase {
             ShowPhase::Hidden => {}
             ShowPhase::Placing => {
-                let (w_pt, h_pt) = POPUP_SIZE;
+                let (w_pt, h_pt) = match &self.popup.content {
+                    // Needs more room than the item list for the hotkey
+                    // recorder, checkbox, and buttons.
+                    Content::Settings(_) => SETTINGS_SIZE,
+                    _ => POPUP_SIZE,
+                };
                 let cursor = self.popup.target.map(|t| t.cursor);
                 let placement = win::monitor::placement_for(cursor, w_pt, h_pt);
                 // Reapply defensively — M1 found this doesn't reliably
@@ -597,11 +742,28 @@ impl eframe::App for App {
 
     /// Only ever runs while `Shown` — eframe skips `ui` entirely for a
     /// hidden window, and the earlier phases have nothing to draw yet.
+    ///
+    /// `Content::Settings` is the one variant here that both draws *and*
+    /// decides on an action (Save/Cancel), unlike the others where
+    /// `update_shown` (called from `logic()`) already decided everything
+    /// and this function only draws — it needs a `Ui` to render itself and
+    /// to read its own input (the hotkey recorder's key capture), and
+    /// `update_shown` doesn't have one. Any resulting action is recorded
+    /// and applied *after* the match, once the borrow of `self.popup.content`
+    /// the match holds has ended, the same pattern `advance_delivery` and
+    /// `update_shown` use.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.popup.phase != ShowPhase::Shown {
             return;
         }
-        match &self.popup.content {
+
+        enum PostAction {
+            Hide,
+            Save(ConfigWindowState),
+        }
+        let mut post_action = None;
+
+        match &mut self.popup.content {
             Content::Prompting { password, error } => {
                 crate::ui::popup::prompting(ui, password.chars().count(), error.as_deref());
             }
@@ -611,16 +773,64 @@ impl eframe::App for App {
                     .cached_entries
                     .as_ref()
                     .map_or((&[][..], 0), |(e, d)| (e.as_slice(), *d));
-                let elevated = self
-                    .popup
-                    .target
-                    .is_some_and(|t| t.elevated_beyond_us);
+                let elevated = self.popup.target.is_some_and(|t| t.elevated_beyond_us);
                 if let Some(clicked) =
                     crate::ui::popup::showing_list(ui, entries, *selected, dropped, elevated)
                 {
-                    self.popup.content = Content::ShowingList { selected: clicked };
+                    *selected = clicked;
                 }
             }
+            Content::Settings(state) => {
+                // Recording needs the *current* hotkey combination to be a
+                // normal, capturable key event rather than intercepted
+                // system-wide by its own `RegisterHotKey` registration (see
+                // `Hotkey::suspend`'s doc) — otherwise re-confirming (or
+                // just noticing you're retyping) the live combo is
+                // impossible: the keystroke never reaches this window.
+                if state.recording && !self.hotkey_suspended {
+                    self.hotkey.suspend();
+                    self.hotkey_suspended = true;
+                } else if !state.recording && self.hotkey_suspended {
+                    self.hotkey.resume();
+                    self.hotkey_suspended = false;
+                }
+
+                match config_window::draw(ui, state) {
+                    config_window::Action::None => {}
+                    config_window::Action::Cancel => {
+                        // Belt-and-suspenders beyond the check above: the
+                        // Cancel button is reachable while `recording` is
+                        // still true, which would otherwise leave the
+                        // hotkey suspended with nothing left to un-suspend
+                        // it once Settings closes.
+                        if self.hotkey_suspended {
+                            self.hotkey.resume();
+                            self.hotkey_suspended = false;
+                        }
+                        post_action = Some(PostAction::Hide);
+                    }
+                    config_window::Action::Save => {
+                        if self.hotkey_suspended {
+                            self.hotkey.resume();
+                            self.hotkey_suspended = false;
+                        }
+                        post_action = Some(PostAction::Save(state.clone()));
+                    }
+                }
+            }
+        }
+
+        match post_action {
+            None => {}
+            Some(PostAction::Hide) => self.hide_popup(ui.ctx()),
+            Some(PostAction::Save(state)) => match self.try_apply_config_window(&state) {
+                Ok(()) => self.hide_popup(ui.ctx()),
+                Err(e) => {
+                    if let Content::Settings(s) = &mut self.popup.content {
+                        s.message = Some((e, true));
+                    }
+                }
+            },
         }
     }
 }

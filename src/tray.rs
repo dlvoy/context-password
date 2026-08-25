@@ -7,24 +7,33 @@
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-/// The id `MenuEvent::set_event_handler` compares against to know Show was
-/// chosen — opens the popup centered on the primary monitor, the same path
-/// the delayed-unlock prompt uses, since a tray click has no cursor/target
+/// Opens the popup centered on the primary monitor, the same path the
+/// delayed-unlock prompt uses, since a tray click has no cursor/target
 /// context to place relative to.
 pub const SHOW_ID: &str = "show";
-/// The id for Quit.
+/// Forgets the unlocked session and clears cached items from memory.
+pub const LOCK_ID: &str = "lock";
+/// Opens the settings window.
+pub const SETTINGS_ID: &str = "settings";
 pub const QUIT_ID: &str = "quit";
 
 pub fn build() -> tray_icon::Result<TrayIcon> {
     let menu = Menu::new();
     let show = MenuItem::with_id(SHOW_ID, "Show", true, None);
+    let lock = MenuItem::with_id(LOCK_ID, "Lock", true, None);
+    let settings = MenuItem::with_id(SETTINGS_ID, "Settings…", true, None);
     let quit = MenuItem::with_id(QUIT_ID, "Quit", true, None);
-    menu.append(&show)
-        .expect("appending a single item to a fresh menu cannot fail");
-    menu.append(&PredefinedMenuItem::separator())
-        .expect("appending a single item to a fresh menu cannot fail");
-    menu.append(&quit)
-        .expect("appending a single item to a fresh menu cannot fail");
+
+    let append = |item: &dyn tray_icon::menu::IsMenuItem| {
+        menu.append(item)
+            .expect("appending a single item to a fresh menu cannot fail")
+    };
+    append(&show);
+    append(&lock);
+    append(&PredefinedMenuItem::separator());
+    append(&settings);
+    append(&PredefinedMenuItem::separator());
+    append(&quit);
 
     TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -33,9 +42,8 @@ pub fn build() -> tray_icon::Result<TrayIcon> {
         .build()
 }
 
-/// A solid placeholder glyph until a real icon is designed (see the plan's
-/// M8 hardening/polish milestone). 16x16 keeps the tray crisp at 100%
-/// scaling; Windows scales it up itself at higher DPI.
+/// A solid placeholder glyph until a real icon is designed. 16x16 keeps the
+/// tray crisp at 100% scaling; Windows scales it up itself at higher DPI.
 fn placeholder_icon() -> Icon {
     const SIZE: u32 = 16;
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);

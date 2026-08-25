@@ -17,3 +17,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A warning when the previously focused window is running elevated, since typing into it would otherwise silently do nothing.
 - The popup follows your Windows light or dark theme.
 - The popup stays fully on screen and at a consistent size regardless of which monitor or display scaling it's summoned on.
+- A Settings window, opened from the tray, for changing the global hotkey and toggling "Start with Windows" — both take effect immediately, no restart needed.
+- A tray Lock action that clears the cached vault items and locks the vault, so the master password is required again next time.

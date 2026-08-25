@@ -54,6 +54,22 @@ fn worker_loop(
                 let _ = results_tx.send(Msg::Bw(result));
                 ctx.request_repaint();
             }
+            BwCmd::Lock => {
+                // Best-effort and silent either way: the worker's own
+                // session field is dropped (and zeroized) regardless of
+                // whether the CLI call itself succeeds — the user's intent
+                // is "we don't have a vault open anymore," not "only if the
+                // CLI agrees."
+                match exe::resolve(bw_path).map(|exe| cmd::lock(&exe)) {
+                    Ok(Ok(output)) if output.status.success() => {
+                        eprintln!("bw: locked");
+                    }
+                    Ok(Ok(_)) => eprintln!("bw: lock command returned a non-success exit code"),
+                    Ok(Err(e)) => eprintln!("bw: failed to spawn lock: {e}"),
+                    Err(e) => eprintln!("bw: failed to resolve executable for lock: {e}"),
+                }
+                session = None;
+            }
         }
     }
 }

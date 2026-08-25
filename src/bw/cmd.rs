@@ -81,6 +81,19 @@ pub fn list_items(exe: &BwExe, session_key: &str, search_term: &str) -> io::Resu
     cmd.output()
 }
 
+/// `bw lock` — destroys the CLI's own active session keys. Doesn't need
+/// `BW_SESSION` itself (locking isn't scoped to a particular session), but
+/// this only ever runs from an explicit user action (the tray's Lock item),
+/// never automatically on exit — see plan §8 on why that distinction
+/// matters (it would invalidate session keys the user may be relying on in
+/// other terminals, which is fine when they asked for it and surprising
+/// when they didn't).
+pub fn lock(exe: &BwExe) -> io::Result<Output> {
+    let mut cmd = base(exe);
+    cmd.args(["lock", "--nointeraction"]);
+    cmd.output()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

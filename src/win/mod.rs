@@ -1,3 +1,4 @@
+pub mod autostart;
 pub mod focus;
 pub mod integrity;
 pub mod monitor;

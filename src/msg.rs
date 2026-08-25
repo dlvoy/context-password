@@ -13,7 +13,7 @@ pub enum Msg {
     Hotkey(Target),
     /// Open the popup with no cursor/target context — used by the tray's
     /// Show item and by the delayed-unlock timer. Falls back to centering
-    /// on the primary monitor (see `win::window_style::primary_monitor_center`).
+    /// on the primary monitor (see `win::monitor::placement_for`).
     ShowPopup,
     Bw(BwResult),
 }
@@ -21,12 +21,22 @@ pub enum Msg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCmd {
     Show,
+    /// Forget the unlocked session: clears the cached items (and their
+    /// passwords) from memory, tells the worker to run `bw lock` and drop
+    /// its own session key, and — if the popup is open — snaps it back to
+    /// the password prompt immediately.
+    Lock,
+    Settings,
     Quit,
 }
 
 /// Commands the UI thread sends to the `bw` worker.
 pub enum BwCmd {
     Unlock(Secret),
+    /// Best-effort: runs `bw lock` and drops the worker's own session key
+    /// regardless of whether that call succeeds — the user's intent is "we
+    /// don't have a vault open anymore," not "only if the CLI agrees."
+    Lock,
 }
 
 /// Results the `bw` worker sends back. Never carries the session key —
