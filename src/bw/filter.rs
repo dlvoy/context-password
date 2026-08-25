@@ -60,6 +60,7 @@ pub fn build_entries(items: Vec<RawItem>, prefix: &str) -> (Vec<Entry>, usize) {
             dropped += 1;
             continue;
         };
+        let has_totp = login.totp.is_some_and(|t| !t.is_empty());
 
         entries.push(Entry {
             id: item.id,
@@ -67,6 +68,7 @@ pub fn build_entries(items: Vec<RawItem>, prefix: &str) -> (Vec<Entry>, usize) {
             username: login.username,
             ord,
             password: Secret::new(password),
+            has_totp,
         });
     }
 
@@ -112,6 +114,7 @@ mod tests {
                     .collect(),
                 username: Some("user".to_string()),
                 password: password.map(str::to_string),
+                totp: None,
             }),
         }
     }
@@ -338,5 +341,35 @@ mod tests {
         assert_eq!(entries[0].name, "nas - admin"); // ord 1
         assert_eq!(entries[1].name, "example@home-server"); // ord 2
         assert_eq!(entries[2].name, "git-mirror - token"); // ord 3
+        assert!(entries[0].has_totp, "nas - admin has a totp field in the fixture");
+        assert!(!entries[1].has_totp, "example@home-server has no totp field");
+    }
+
+    #[test]
+    fn has_totp_is_false_when_the_field_is_absent_or_empty() {
+        let mut with_empty = item(
+            "1",
+            "empty-totp",
+            1,
+            vec![("app://context-password/1", None)],
+            Some("pw"),
+        );
+        with_empty.login.as_mut().unwrap().totp = Some(String::new());
+        let (entries, _) = build_entries(vec![with_empty], PREFIX);
+        assert!(!entries[0].has_totp);
+    }
+
+    #[test]
+    fn has_totp_is_true_when_the_field_is_present() {
+        let mut with_totp = item(
+            "1",
+            "has-totp",
+            1,
+            vec![("app://context-password/1", None)],
+            Some("pw"),
+        );
+        with_totp.login.as_mut().unwrap().totp = Some("SEED".to_string());
+        let (entries, _) = build_entries(vec![with_totp], PREFIX);
+        assert!(entries[0].has_totp);
     }
 }

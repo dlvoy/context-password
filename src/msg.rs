@@ -37,6 +37,10 @@ pub enum BwCmd {
     /// regardless of whether that call succeeds — the user's intent is "we
     /// don't have a vault open anymore," not "only if the CLI agrees."
     Lock,
+    /// Fetches the current TOTP code for one item, by id. Requires the
+    /// worker to already hold a session (it always should — the item only
+    /// ever appears in a list fetched after a successful unlock).
+    GetTotp(String),
 }
 
 /// Results the `bw` worker sends back. Never carries the session key —
@@ -44,4 +48,7 @@ pub enum BwCmd {
 pub enum BwResult {
     Items { entries: Vec<Entry>, dropped: usize },
     Failed { stage: &'static str, message: String },
+    /// `bw lock` finished (successfully or not — see `BwCmd::Lock`'s doc).
+    Locked,
+    Totp(Secret),
 }

@@ -9,6 +9,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Bounds for `max_visible_items`, enforced both by the Settings widget and
+/// defensively by `Config::effective_max_visible`.
+pub const MIN_VISIBLE_ITEMS: u32 = 3;
+pub const MAX_VISIBLE_ITEMS: u32 = 10;
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnlockMode {
@@ -34,6 +39,9 @@ pub struct Config {
     pub uri_prefix: String,
     /// How long to wait after regaining foreground before typing starts.
     pub type_settle_ms: u32,
+    /// How many tagged items the popup shows at once. Not read directly —
+    /// use `effective_max_visible` — since a hand-edited config file could
+    /// carry a value outside the range the Settings widget enforces.
     pub max_visible_items: u32,
     /// Whether to run `bw lock` on quit. Off by default: it would invalidate
     /// session keys the user may be relying on in other terminals.
@@ -51,7 +59,7 @@ impl Default for Config {
             bw_path: String::new(),
             uri_prefix: "app://context-password".to_string(),
             type_settle_ms: 30,
-            max_visible_items: 12,
+            max_visible_items: 4,
             lock_on_exit: false,
             debug_log: false,
         }
@@ -59,6 +67,14 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The number of items the popup should actually show, clamped to
+    /// `MIN_VISIBLE_ITEMS..=MAX_VISIBLE_ITEMS` regardless of what's on disk
+    /// — a hand-edited config shouldn't be able to produce a popup sized
+    /// for an out-of-range count.
+    pub fn effective_max_visible(&self) -> usize {
+        self.max_visible_items.clamp(MIN_VISIBLE_ITEMS, MAX_VISIBLE_ITEMS) as usize
+    }
+
     pub fn config_path() -> io::Result<PathBuf> {
         let appdata = std::env::var_os("APPDATA")
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "%APPDATA% is not set"))?;
@@ -123,5 +139,15 @@ mod tests {
         let cfg: Config = toml::from_str(r#"hotkey = "Ctrl+Alt+KeyB""#).unwrap();
         assert_eq!(cfg.hotkey, "Ctrl+Alt+KeyB");
         assert_eq!(cfg.unlock_delay_secs, Config::default().unlock_delay_secs);
+    }
+
+    #[test]
+    fn effective_max_visible_clamps_an_out_of_range_value() {
+        let cfg = Config { max_visible_items: 1, ..Config::default() };
+        assert_eq!(cfg.effective_max_visible(), MIN_VISIBLE_ITEMS as usize);
+        let cfg = Config { max_visible_items: 99, ..Config::default() };
+        assert_eq!(cfg.effective_max_visible(), MAX_VISIBLE_ITEMS as usize);
+        let cfg = Config { max_visible_items: 5, ..Config::default() };
+        assert_eq!(cfg.effective_max_visible(), 5);
     }
 }

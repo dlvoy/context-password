@@ -82,15 +82,25 @@ pub fn list_items(exe: &BwExe, session_key: &str, search_term: &str) -> io::Resu
 }
 
 /// `bw lock` — destroys the CLI's own active session keys. Doesn't need
-/// `BW_SESSION` itself (locking isn't scoped to a particular session), but
-/// this only ever runs from an explicit user action (the tray's Lock item),
-/// never automatically on exit — see plan §8 on why that distinction
-/// matters (it would invalidate session keys the user may be relying on in
-/// other terminals, which is fine when they asked for it and surprising
-/// when they didn't).
+/// `BW_SESSION` itself (locking isn't scoped to a particular session). Runs
+/// from the tray's Lock item, and optionally on exit if `lock_on_exit` is
+/// enabled — off by default, since it would invalidate session keys the
+/// user may be relying on in other terminals, which is fine when they asked
+/// for it and surprising when they didn't (plan §8).
 pub fn lock(exe: &BwExe) -> io::Result<Output> {
     let mut cmd = base(exe);
     cmd.args(["lock", "--nointeraction"]);
+    cmd.output()
+}
+
+/// `bw get totp <item_id> --raw`, session via `BW_SESSION` like every other
+/// authenticated call. Fetched fresh at the moment of use rather than
+/// computed from the seed locally — see the plan's rationale (reuses
+/// Bitwarden's own algorithm exactly, no local crypto dependency).
+pub fn get_totp(exe: &BwExe, session_key: &str, item_id: &str) -> io::Result<Output> {
+    let mut cmd = base(exe);
+    cmd.args(["get", "totp", item_id, "--raw", "--nointeraction"])
+        .env("BW_SESSION", session_key);
     cmd.output()
 }
 

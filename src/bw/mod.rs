@@ -59,7 +59,9 @@ fn worker_loop(
                 // session field is dropped (and zeroized) regardless of
                 // whether the CLI call itself succeeds — the user's intent
                 // is "we don't have a vault open anymore," not "only if the
-                // CLI agrees."
+                // CLI agrees." The UI still needs to know it's *done*
+                // though (§2/§7 of the plan both wait on this), hence
+                // `BwResult::Locked` regardless of which branch ran.
                 match exe::resolve(bw_path).map(|exe| cmd::lock(&exe)) {
                     Ok(Ok(output)) if output.status.success() => {
                         eprintln!("bw: locked");
@@ -69,9 +71,63 @@ fn worker_loop(
                     Err(e) => eprintln!("bw: failed to resolve executable for lock: {e}"),
                 }
                 session = None;
+                let _ = results_tx.send(Msg::Bw(BwResult::Locked));
+                ctx.request_repaint();
+            }
+            BwCmd::GetTotp(item_id) => {
+                let result = get_totp(bw_path, &item_id, &session);
+                let _ = results_tx.send(Msg::Bw(result));
+                ctx.request_repaint();
             }
         }
     }
+}
+
+fn get_totp(bw_path: &str, item_id: &str, session: &Option<Secret>) -> BwResult {
+    let Some(session) = session else {
+        // Shouldn't normally be reachable — the item list this id came from
+        // only exists after a successful unlock — but handled rather than
+        // unwrapped in case a lock races a still-open popup.
+        return BwResult::Failed {
+            stage: "totp",
+            message: "vault is locked".to_string(),
+        };
+    };
+    let exe = match exe::resolve(bw_path) {
+        Ok(exe) => exe,
+        Err(message) => {
+            return BwResult::Failed {
+                stage: "totp",
+                message,
+            };
+        }
+    };
+    let mut output = match cmd::get_totp(&exe, session.expose(), item_id) {
+        Ok(o) => o,
+        Err(e) => {
+            return BwResult::Failed {
+                stage: "totp",
+                message: e.to_string(),
+            };
+        }
+    };
+    if !output.status.success() {
+        return BwResult::Failed {
+            stage: "totp",
+            message: "bw get totp failed (does this item have a TOTP configured?)".to_string(),
+        };
+    }
+    let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // The buffer held the cleartext code — scrub it before it drops, same
+    // as the unlock/list stdout buffers.
+    output.stdout.fill(0);
+    if code.is_empty() {
+        return BwResult::Failed {
+            stage: "totp",
+            message: "bw get totp returned an empty code".to_string(),
+        };
+    }
+    BwResult::Totp(Secret::new(code))
 }
 
 fn unlock_sync_list(

@@ -19,3 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The popup stays fully on screen and at a consistent size regardless of which monitor or display scaling it's summoned on.
 - A Settings window, opened from the tray, for changing the global hotkey and toggling "Start with Windows" — both take effect immediately, no restart needed.
 - A tray Lock action that clears the cached vault items and locks the vault, so the master password is required again next time.
+- Shift+Enter types the selected item's username, and Alt+Enter fetches and types its current one-time code — each shown with its own icon on the list.
+- Number keys 1–9 and 0 jump straight to an item in the list and type it immediately, matching a numbered badge on each row.
+- A "Max visible items" control and a "Lock vault on exit" option in Settings.
+- Visible progress in the popup while the vault is being locked.
+
+### Changed
+
+- The tray's Show item is labeled "Unlock" until the vault has been unlocked, and Lock only appears once it has.
+- The item list is capped to a configurable number of rows (4 by default) instead of showing everything at once.
+- The Settings window has larger text, more padding, and a Save/Cancel row pinned to the bottom.

@@ -27,6 +27,13 @@
 //! toggle, both applied live (re-registering the hotkey without a
 //! restart). It also adds the tray's Lock item: forgets the cached items
 //! and the worker's session key, and tells `bw` to lock too.
+//!
+//! A later round adds: tray text/visibility reflecting vault state
+//! (`VaultState`), visible progress while locking (`Content::Locking`),
+//! username/OTP autotype alongside the password (`DeliveryKind`,
+//! `Content::FetchingOtp`), a digit quick-select, a configurable
+//! `max_visible_items` with a dynamically sized list popup, and
+//! lock-on-exit with a timeout (`ExitState`).
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -42,6 +49,7 @@ use crate::msg::{BwCmd, BwResult, Msg, TrayCmd};
 use crate::secret::Secret;
 use crate::ui::config_window;
 use crate::ui::config_window::ConfigWindowState;
+use crate::ui::popup::IconMode;
 use crate::win::focus::{self, ActivationResult, Target};
 use crate::{bw, tray, win};
 
@@ -56,6 +64,46 @@ const FOREGROUND_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const POPUP_SIZE: (i32, i32) = (340, 220);
 const SETTINGS_SIZE: (i32, i32) = (380, 300);
+/// Non-list chrome above/below the item rows in `ShowingList` (title,
+/// separators, hint footer, spacing) — hand-tuned the same way `POPUP_SIZE`
+/// itself was, revisit if the list ever looks cramped or has dead space at
+/// the top/bottom.
+const LIST_CHROME_HEIGHT: f32 = 100.0;
+/// How long Quit waits for `bw lock` to finish when `lock_on_exit` is on,
+/// before giving up and closing anyway — a hung or very slow `bw` must
+/// never make quitting feel stuck.
+const LOCK_ON_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The height of a `ShowingList` popup that shows exactly `max_visible`
+/// rows, no more and no less — no dead space, no overflow.
+fn list_popup_height(max_visible: usize) -> i32 {
+    (LIST_CHROME_HEIGHT + max_visible as f32 * crate::ui::popup::ITEM_ROW_HEIGHT).round() as i32
+}
+
+/// The visible-row index a quick-select digit key was just pressed for
+/// (`1`..`9` → 0..8, `0` → 9), if any — the keyboard counterpart of
+/// `ui::popup::badge_for`'s numbering.
+fn digit_pressed(ctx: &egui::Context) -> Option<usize> {
+    use egui::Key;
+    const DIGITS: [(Key, usize); 10] = [
+        (Key::Num1, 0),
+        (Key::Num2, 1),
+        (Key::Num3, 2),
+        (Key::Num4, 3),
+        (Key::Num5, 4),
+        (Key::Num6, 5),
+        (Key::Num7, 6),
+        (Key::Num8, 7),
+        (Key::Num9, 8),
+        (Key::Num0, 9),
+    ];
+    ctx.input(|i| {
+        DIGITS
+            .iter()
+            .find(|(key, _)| i.key_pressed(*key))
+            .map(|(_, idx)| *idx)
+    })
+}
 
 /// The popup's show/hide state — window mechanics, independent of what's
 /// displayed once shown (`Content`, below). `Placing`/`Showing`/`Activating`
@@ -77,7 +125,22 @@ enum Content {
         error: Option<String>,
     },
     Unlocking,
+    /// Waiting on `bw lock` to finish — shown instead of leaving the popup
+    /// blank or jumping straight to the prompt if it's opened (or already
+    /// open) while a lock triggered from the tray is still in flight.
+    Locking,
     ShowingList {
+        selected: usize,
+        /// An inline reason a requested field couldn't be delivered (no
+        /// username, no TOTP configured) — cleared on the next selection
+        /// change or delivery attempt, not a lingering banner.
+        message: Option<String>,
+    },
+    /// Waiting on `bw get totp` for the item at `selected` (in the same
+    /// cached list `ShowingList` reads from). Unlike `Unlocking`/`Locking`
+    /// there's a natural "back" — Escape returns to `ShowingList { selected,
+    /// .. }` instead of hiding the whole popup.
+    FetchingOtp {
         selected: usize,
     },
     /// The settings screen (M7). A screen within the *same* popup window
@@ -89,6 +152,59 @@ enum Content {
     /// Settings into the existing show/hide machinery sidesteps the bug
     /// entirely instead of working around eframe internals.
     Settings(config_window::ConfigWindowState),
+}
+
+/// Which field Enter/a digit delivers, driven by which modifier is held.
+/// The render side (`ui::popup::IconMode`) mirrors this one-to-one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeliveryKind {
+    Password,
+    Username,
+    Otp,
+}
+
+impl DeliveryKind {
+    /// Shift wins over Alt if somehow both are held — an arbitrary but
+    /// documented tie-break, not a meaningful combination either way.
+    fn from_modifiers(modifiers: egui::Modifiers) -> Self {
+        if modifiers.shift {
+            Self::Username
+        } else if modifiers.alt {
+            Self::Otp
+        } else {
+            Self::Password
+        }
+    }
+
+    fn icon_mode(self) -> IconMode {
+        match self {
+            Self::Password => IconMode::Password,
+            Self::Username => IconMode::Username,
+            Self::Otp => IconMode::Otp,
+        }
+    }
+}
+
+/// Whether the vault currently has anything unlocked — drives the tray's
+/// `Show`/`Unlock` label and whether `Lock` is present at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VaultState {
+    Locked,
+    Unlocked,
+    /// `bw lock` has been sent but hasn't finished yet.
+    Locking,
+}
+
+/// Quitting normally just closes the root viewport; `lock_on_exit` needs to
+/// briefly *not* do that so a `bw lock` call has a chance to finish first
+/// (§7 of the plan) — tracked here rather than a bare bool so the "already
+/// asked once" state survives across frames without re-deriving it from
+/// `vault_state`, which also changes for unrelated reasons (the tray's own
+/// Lock item).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExitState {
+    NotExiting,
+    WaitingForLock { deadline: Instant },
 }
 
 struct PopupState {
@@ -159,7 +275,7 @@ pub struct App {
     // Order matters for Drop: dropping the tray icon removes it from the
     // shell; nothing here depends on drop order otherwise, but keep it
     // explicit rather than relying on field order being incidental.
-    _tray: tray_icon::TrayIcon,
+    tray: tray::TrayHandles,
     hotkey: Hotkey,
     hwnd: windows_sys::Win32::Foundation::HWND,
     cfg: Config,
@@ -180,6 +296,8 @@ pub struct App {
     /// registration is guaranteed to be restored even if the screen closes
     /// mid-recording.
     hotkey_suspended: bool,
+    vault_state: VaultState,
+    exit_state: ExitState,
 }
 
 impl App {
@@ -263,7 +381,12 @@ impl App {
             });
         }
 
-        let _tray = tray::build()?;
+        let mut tray = tray::build()?;
+        // Locked at startup, so the tray should say "Unlock" and hide
+        // "Lock" from the very first frame, not just after the first state
+        // change.
+        tray.set_show_label(false);
+        tray.set_lock_visible(false);
 
         let bw_cmd_tx = bw::spawn(
             cfg.bw_path.clone(),
@@ -273,7 +396,7 @@ impl App {
         );
 
         Ok(Self {
-            _tray,
+            tray,
             hotkey,
             hwnd,
             cfg,
@@ -290,6 +413,8 @@ impl App {
             stats: ActivationStats::default(),
             cached_entries: None,
             hotkey_suspended: false,
+            vault_state: VaultState::Locked,
+            exit_state: ExitState::NotExiting,
         })
     }
 
@@ -297,25 +422,41 @@ impl App {
     /// path, with no cursor context). Content is decided once, here, from
     /// whichever cache state currently holds — not re-decided every frame.
     fn open_popup(&mut self, target: Option<Target>) {
-        if self.delivery.is_some() || matches!(self.popup.content, Content::Settings(_)) {
-            // Never interrupt a delivery already in flight, or a Settings
-            // screen the user has open — a stray tray "Show" or (while a
-            // hotkey change is mid-edit) even the live hotkey firing should
-            // not silently discard an in-progress edit.
+        if self.delivery.is_some()
+            || matches!(
+                self.popup.content,
+                Content::Settings(_) | Content::FetchingOtp { .. }
+            )
+        {
+            // Never interrupt a delivery already in flight, a Settings
+            // screen the user has open, or an in-flight OTP fetch — a
+            // stray tray "Show" or (while a hotkey change is mid-edit) even
+            // the live hotkey firing should not silently discard an
+            // in-progress edit or lose a code that's about to arrive.
             return;
         }
         self.popup.target = target;
         self.popup.content = match (&self.cached_entries, &self.popup.content) {
-            (Some(_), _) => Content::ShowingList { selected: 0 },
-            // An unlock submitted before the popup was last dismissed may
-            // still be in flight on the worker thread — resume showing the
-            // spinner instead of discarding that state and asking the user
-            // to type their password again (`handle_bw_result` still
-            // updates this content field even while the popup is hidden).
+            (Some(_), _) => Content::ShowingList { selected: 0, message: None },
+            // An unlock (or lock) submitted before the popup was last
+            // dismissed may still be in flight on the worker thread —
+            // resume showing the spinner instead of discarding that state
+            // (`handle_bw_result` still updates this content field even
+            // while the popup is hidden).
             (None, Content::Unlocking) => Content::Unlocking,
+            (None, Content::Locking) => Content::Locking,
             (None, _) => PopupState::fresh_prompt(),
         };
         self.popup.phase = ShowPhase::Placing;
+    }
+
+    /// Keeps the tray's `Show`/`Unlock` label and `Lock` item's presence in
+    /// sync with `vault_state` — call this instead of assigning
+    /// `self.vault_state` directly, so the two can never drift apart.
+    fn set_vault_state(&mut self, state: VaultState) {
+        self.vault_state = state;
+        self.tray.set_show_label(state == VaultState::Unlocked);
+        self.tray.set_lock_visible(state == VaultState::Unlocked);
     }
 
     fn hide_popup(&mut self, ctx: &egui::Context) {
@@ -341,15 +482,23 @@ impl App {
 
     /// Forgets everything the app currently has unlocked: the cached items
     /// (and their passwords, zeroized on drop), and — via the worker — its
-    /// own session key and the CLI's, best-effort. If the popup is open and
-    /// showing the item list, it snaps back to the password prompt right
-    /// away rather than continuing to show a list that's no longer valid.
+    /// own session key and the CLI's, best-effort. Shows visible progress
+    /// (`Content::Locking`) unconditionally rather than only when the popup
+    /// happens to already be showing the list — pressing the hotkey while a
+    /// lock is in flight should reveal that progress, not the empty prompt
+    /// or nothing at all.
     fn handle_lock(&mut self) {
         eprintln!("lock: clearing cached items and locking the vault");
         self.cached_entries = None;
-        if matches!(self.popup.content, Content::ShowingList { .. }) {
-            self.popup.content = PopupState::fresh_prompt();
+        if self.hotkey_suspended {
+            // Settings might be mid-recording when a global Lock action
+            // interrupts it — don't leave the hotkey unregistered with
+            // nothing left to resume it.
+            self.hotkey.resume();
+            self.hotkey_suspended = false;
         }
+        self.popup.content = Content::Locking;
+        self.set_vault_state(VaultState::Locking);
         let _ = self.bw_cmd_tx.send(BwCmd::Lock);
     }
 
@@ -370,18 +519,57 @@ impl App {
                     }
                 }
                 self.cached_entries = Some((entries, dropped));
+                self.set_vault_state(VaultState::Unlocked);
                 if matches!(self.popup.content, Content::Unlocking) {
-                    self.popup.content = Content::ShowingList { selected: 0 };
+                    self.popup.content = Content::ShowingList { selected: 0, message: None };
                 }
             }
             BwResult::Failed { stage, message } => {
                 eprintln!("bw: failed at {stage}: {message}");
-                if matches!(self.popup.content, Content::Unlocking) {
-                    self.popup.content = Content::Prompting {
-                        password: Zeroizing::new(String::with_capacity(256)),
-                        error: Some(format!("{stage}: {message}")),
-                    };
+                match &self.popup.content {
+                    Content::Unlocking => {
+                        self.popup.content = Content::Prompting {
+                            password: Zeroizing::new(String::with_capacity(256)),
+                            error: Some(format!("{stage}: {message}")),
+                        };
+                    }
+                    Content::FetchingOtp { selected } => {
+                        let selected = *selected;
+                        self.popup.content = Content::ShowingList {
+                            selected,
+                            message: Some(format!("{stage}: {message}")),
+                        };
+                    }
+                    _ => {}
                 }
+            }
+            BwResult::Locked => {
+                if self.cfg.debug_log {
+                    eprintln!("bw: lock finished");
+                }
+                self.set_vault_state(VaultState::Locked);
+                if matches!(self.popup.content, Content::Locking) {
+                    self.popup.content = PopupState::fresh_prompt();
+                }
+            }
+            BwResult::Totp(code) => {
+                let Content::FetchingOtp { selected } = self.popup.content else {
+                    return; // Stale — content already moved on.
+                };
+                let Some(target) = self.popup.target else {
+                    self.popup.content = Content::ShowingList {
+                        selected,
+                        message: Some("no delivery target".to_string()),
+                    };
+                    return;
+                };
+                let log_line = self
+                    .cached_entries
+                    .as_ref()
+                    .and_then(|(entries, _)| entries.get(selected))
+                    .map(Entry::log_line)
+                    .unwrap_or_default();
+                self.begin_delivery(target, code, &log_line);
             }
         }
     }
@@ -474,7 +662,8 @@ impl App {
             None,
             Hide,
             Unlock(Secret),
-            Deliver,
+            Deliver(DeliveryKind),
+            BackToList(usize),
         }
         let mut action = Action::None;
 
@@ -508,19 +697,24 @@ impl App {
                     action = Action::Hide;
                 }
             }
-            Content::Unlocking => {
+            Content::Unlocking | Content::Locking => {
                 // Dismiss-on-blur is suspended here (plan §1): an 8-15s
-                // cold unlock that vanishes on a stray click would be
-                // maddening. Escape still works — explicit intent.
+                // cold unlock (or a lock) that vanishes on a stray click
+                // would be maddening. Escape still works — explicit intent.
                 if escape {
                     action = Action::Hide;
                 }
             }
-            Content::ShowingList { selected } => {
-                let count = self.cached_entries.as_ref().map_or(0, |(e, _)| e.len());
+            Content::ShowingList { selected, message } => {
+                let count = self
+                    .cached_entries
+                    .as_ref()
+                    .map_or(0, |(e, _)| e.len().min(self.cfg.effective_max_visible()));
+                let mut moved = false;
                 if count > 0 {
                     if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                         *selected = (*selected + 1) % count;
+                        moved = true;
                     }
                     if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                         *selected = if *selected == 0 {
@@ -528,18 +722,36 @@ impl App {
                         } else {
                             *selected - 1
                         };
+                        moved = true;
                     }
                     if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
                         *selected = 0;
+                        moved = true;
                     }
                     if ctx.input(|i| i.key_pressed(egui::Key::End)) {
                         *selected = count - 1;
+                        moved = true;
+                    }
+                    if let Some(i) = digit_pressed(ctx).filter(|&i| i < count) {
+                        *selected = i;
+                        moved = true;
                     }
                 }
+                if moved {
+                    *message = None;
+                }
                 if enter && count > 0 {
-                    action = Action::Deliver;
+                    let kind = DeliveryKind::from_modifiers(ctx.input(|i| i.modifiers));
+                    action = Action::Deliver(kind);
                 } else if escape || blurred {
                     action = Action::Hide;
+                }
+            }
+            Content::FetchingOtp { selected } => {
+                // There's a natural "back" here, unlike Unlocking/Locking —
+                // return to the list rather than hiding the whole popup.
+                if escape {
+                    action = Action::BackToList(*selected);
                 }
             }
             // Handled entirely in `ui()` instead: the settings screen needs
@@ -556,34 +768,81 @@ impl App {
                 let _ = self.bw_cmd_tx.send(BwCmd::Unlock(secret));
                 self.popup.content = Content::Unlocking;
             }
-            Action::Deliver => self.start_delivery(),
+            Action::Deliver(kind) => self.start_delivery(kind),
+            Action::BackToList(selected) => {
+                self.popup.content = Content::ShowingList { selected, message: None };
+            }
         }
     }
 
-    fn start_delivery(&mut self) {
-        let Content::ShowingList { selected } = &self.popup.content else {
+    /// Dispatches Enter/a digit for the currently selected item.
+    /// `Password`/`Username` already have their secret on hand (in the
+    /// cache) and go straight to `begin_delivery`; `Otp` doesn't, and goes
+    /// through `Content::FetchingOtp` and a worker round trip instead.
+    fn start_delivery(&mut self, kind: DeliveryKind) {
+        let Content::ShowingList { selected, .. } = &self.popup.content else {
             return;
         };
+        let selected = *selected;
         let Some((entries, _)) = &self.cached_entries else {
             return;
         };
-        let Some(entry) = entries.get(*selected) else {
+        let Some(entry) = entries.get(selected) else {
             return;
         };
         let Some(target) = self.popup.target else {
             return;
         };
 
+        match kind {
+            DeliveryKind::Password => {
+                let secret = entry.password.clone_secret();
+                let log_line = entry.log_line();
+                self.begin_delivery(target, secret, &log_line);
+            }
+            DeliveryKind::Username => {
+                let Some(username) = entry.username.clone() else {
+                    self.set_list_message(selected, "This item has no username.".to_string());
+                    return;
+                };
+                let log_line = entry.log_line();
+                self.begin_delivery(target, Secret::new(username), &log_line);
+            }
+            DeliveryKind::Otp => {
+                if !entry.has_totp {
+                    self.set_list_message(selected, "This item has no TOTP configured.".to_string());
+                    return;
+                }
+                let item_id = entry.id.clone();
+                self.popup.content = Content::FetchingOtp { selected };
+                let _ = self.bw_cmd_tx.send(BwCmd::GetTotp(item_id));
+            }
+        }
+    }
+
+    /// Replaces the popup's content with `ShowingList` at `selected`,
+    /// carrying an inline error — used when a requested field (username,
+    /// OTP) can't be delivered, per the settled decision to say so rather
+    /// than silently falling back to the password.
+    fn set_list_message(&mut self, selected: usize, message: String) {
+        self.popup.content = Content::ShowingList { selected, message: Some(message) };
+    }
+
+    /// The common tail of every delivery kind once its secret is in hand:
+    /// hides the popup and hands off to the frame-driven `Delivering`
+    /// machine (plan §4). `item_log_line` is only ever printed when
+    /// `debug_log` is on (plan §8).
+    fn begin_delivery(&mut self, target: Target, secret: Secret, item_log_line: &str) {
         eprintln!(
             "delivery: starting for target hwnd={} (elevated_beyond_us={})",
             target.hwnd, target.elevated_beyond_us
         );
         if self.cfg.debug_log {
-            eprintln!("delivery: item {}", entry.log_line());
+            eprintln!("delivery: item {item_log_line}");
         }
         self.delivery = Some(Delivery {
             target,
-            secret: entry.password.clone_secret(),
+            secret,
             phase: DeliveryPhase::HidePopup,
             deadline: Instant::now(),
         });
@@ -607,6 +866,8 @@ impl App {
             hotkey_spec: self.hotkey.spec(),
             recording: false,
             autostart: win::autostart::is_enabled(),
+            lock_on_exit: self.cfg.lock_on_exit,
+            max_visible_items: self.cfg.max_visible_items,
             message: None,
             held: config_window::HeldMods::default(),
         });
@@ -646,6 +907,22 @@ impl App {
                     error.get_or_insert(format!("autostart: {e}"));
                 }
             }
+        }
+
+        // Neither of these can fail — just record and save.
+        if state.lock_on_exit != self.cfg.lock_on_exit {
+            eprintln!(
+                "settings: lock on exit {}",
+                if state.lock_on_exit { "enabled" } else { "disabled" }
+            );
+            self.cfg.lock_on_exit = state.lock_on_exit;
+        }
+        let clamped_max_visible = state
+            .max_visible_items
+            .clamp(crate::config::MIN_VISIBLE_ITEMS, crate::config::MAX_VISIBLE_ITEMS);
+        if clamped_max_visible != self.cfg.max_visible_items {
+            eprintln!("settings: max visible items changed to {clamped_max_visible}");
+            self.cfg.max_visible_items = clamped_max_visible;
         }
 
         if let Err(e) = self.cfg.save() {
@@ -697,6 +974,36 @@ impl eframe::App for App {
             }
         }
 
+        // `close_requested()` reflects any `ViewportCommand::Close` sent
+        // for this viewport, from us (the Quit handler above) or the OS
+        // alike — both funnel into the same `ViewportEvent::Close` egui
+        // tracks (confirmed in egui-0.36.1's `viewport_info.rs`). Checked
+        // every frame regardless of visibility, since this must work even
+        // while the popup is hidden, which is this app's normal state.
+        match self.exit_state {
+            ExitState::NotExiting => {
+                let close_requested = ctx.input(|i| i.viewport().close_requested());
+                if close_requested && self.cfg.lock_on_exit && self.vault_state == VaultState::Unlocked {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.handle_lock();
+                    self.exit_state = ExitState::WaitingForLock {
+                        deadline: Instant::now() + LOCK_ON_EXIT_TIMEOUT,
+                    };
+                    ctx.request_repaint_after(POLL_INTERVAL);
+                }
+                // Otherwise: nothing to do — either there's no close to
+                // react to, or lock-on-exit doesn't apply, and the close
+                // already in flight is left to complete on its own.
+            }
+            ExitState::WaitingForLock { deadline } => {
+                if self.vault_state != VaultState::Locking || Instant::now() >= deadline {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    ctx.request_repaint_after(POLL_INTERVAL);
+                }
+            }
+        }
+
         match self.popup.phase {
             ShowPhase::Hidden => {}
             ShowPhase::Placing => {
@@ -704,6 +1011,9 @@ impl eframe::App for App {
                     // Needs more room than the item list for the hotkey
                     // recorder, checkbox, and buttons.
                     Content::Settings(_) => SETTINGS_SIZE,
+                    Content::ShowingList { .. } => {
+                        (POPUP_SIZE.0, list_popup_height(self.cfg.effective_max_visible()))
+                    }
                     _ => POPUP_SIZE,
                 };
                 let cursor = self.popup.target.map(|t| t.cursor);
@@ -767,17 +1077,33 @@ impl eframe::App for App {
             Content::Prompting { password, error } => {
                 crate::ui::popup::prompting(ui, password.chars().count(), error.as_deref());
             }
-            Content::Unlocking => crate::ui::popup::unlocking(ui),
-            Content::ShowingList { selected } => {
-                let (entries, dropped) = self
+            Content::Unlocking => crate::ui::popup::busy(ui, "Unlocking vault…"),
+            Content::Locking => crate::ui::popup::busy(ui, "Locking vault…"),
+            Content::FetchingOtp { .. } => crate::ui::popup::busy(ui, "Fetching code…"),
+            Content::ShowingList { selected, message } => {
+                let (all_entries, dropped) = self
                     .cached_entries
                     .as_ref()
                     .map_or((&[][..], 0), |(e, d)| (e.as_slice(), *d));
+                let max_visible = self.cfg.effective_max_visible();
+                let entries = &all_entries[..all_entries.len().min(max_visible)];
+                let hidden_by_cap = all_entries.len().saturating_sub(max_visible);
                 let elevated = self.popup.target.is_some_and(|t| t.elevated_beyond_us);
-                if let Some(clicked) =
-                    crate::ui::popup::showing_list(ui, entries, *selected, dropped, elevated)
-                {
+                let icon_mode = DeliveryKind::from_modifiers(ui.input(|i| i.modifiers)).icon_mode();
+                if let Some(clicked) = crate::ui::popup::showing_list(
+                    ui,
+                    entries,
+                    *selected,
+                    crate::ui::popup::ListInfo {
+                        dropped,
+                        hidden_by_cap,
+                        message: message.as_deref(),
+                        target_elevated: elevated,
+                        icon_mode,
+                    },
+                ) {
                     *selected = clicked;
+                    *message = None;
                 }
             }
             Content::Settings(state) => {

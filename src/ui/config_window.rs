@@ -11,9 +11,15 @@
 
 use eframe::egui;
 
+use crate::config::{MAX_VISIBLE_ITEMS, MIN_VISIBLE_ITEMS};
+
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xcc, 0x33, 0x33);
 const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(0x33, 0x99, 0x33);
 const LISTENING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xcc, 0x88, 0x00);
+/// Scales every text style up for this dialog only — the popup itself stays
+/// at egui's defaults, this is specifically "bigger fonts" for Settings.
+const FONT_SCALE: f32 = 1.25;
+const BODY_MARGIN: f32 = 16.0;
 
 /// Working copy of the settings being edited — separate from the live
 /// `Config` until Save is clicked, so a cancelled dialog changes nothing.
@@ -22,6 +28,8 @@ pub struct ConfigWindowState {
     pub hotkey_spec: String,
     pub recording: bool,
     pub autostart: bool,
+    pub lock_on_exit: bool,
+    pub max_visible_items: u32,
     pub message: Option<(String, bool)>,
     /// Physical modifier keys currently held while recording, tracked by
     /// hand rather than trusting egui's aggregated `Modifiers` for this —
@@ -65,67 +73,105 @@ pub fn draw(ui: &mut egui::Ui, state: &mut ConfigWindowState) -> Action {
         return Action::Cancel;
     }
 
+    // Scale this Ui's text styles up for the whole dialog — done once here
+    // rather than per-widget, and as a ratio (not a fixed size) so headings
+    // stay bigger than body text instead of flattening the hierarchy.
+    for font_id in ui.style_mut().text_styles.values_mut() {
+        font_id.size *= FONT_SCALE;
+    }
+
     let mut action = Action::None;
 
-    ui.heading("context-password — Settings");
-    ui.separator();
-    ui.add_space(8.0);
+    egui::Panel::bottom("settings_footer")
+        .show_separator_line(true)
+        .show(ui, |ui| {
+            ui.add_space(8.0);
+            egui::Frame::NONE
+                .inner_margin(egui::Margin::symmetric(BODY_MARGIN as i8, 8))
+                .show(ui, |ui| {
+                    let (cancel_clicked, save_clicked) = egui::Sides::new().show(
+                        ui,
+                        |ui| ui.button("Cancel").clicked(),
+                        |ui| ui.button("Save").clicked(),
+                    );
+                    if cancel_clicked {
+                        action = Action::Cancel;
+                    }
+                    if save_clicked {
+                        action = Action::Save;
+                    }
+                });
+        });
 
-    ui.label("Global hotkey:");
-    ui.horizontal(|ui| {
-        ui.monospace(&state.hotkey_spec);
-        let label = if state.recording {
-            "Press a key combination…"
-        } else {
-            "Record…"
-        };
-        if ui.button(label).clicked() && !state.recording {
-            state.recording = true;
-            state.message = None;
-            state.held = HeldMods::default();
-        }
-    });
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(BODY_MARGIN as i8)))
+        .show(ui, |ui| {
+            ui.heading("context-password — Settings");
+            ui.separator();
+            ui.add_space(8.0);
 
-    if state.recording {
-        let events = ui.input(|i| i.events.clone());
-        match capture_hotkey(&events, &mut state.held) {
-            Capture::Waiting => {
-                ui.colored_label(
-                    LISTENING_COLOR,
-                    "Listening — press your desired combination, or Esc to cancel.",
-                );
+            ui.label("Global hotkey:");
+            ui.horizontal(|ui| {
+                ui.monospace(&state.hotkey_spec);
+                let label = if state.recording {
+                    "Press a key combination…"
+                } else {
+                    "Record…"
+                };
+                if ui.button(label).clicked() && !state.recording {
+                    state.recording = true;
+                    state.message = None;
+                    state.held = HeldMods::default();
+                }
+            });
+
+            if state.recording {
+                let events = ui.input(|i| i.events.clone());
+                match capture_hotkey(&events, &mut state.held) {
+                    Capture::Waiting => {
+                        ui.colored_label(
+                            LISTENING_COLOR,
+                            "Listening — press your desired combination, or Esc to cancel.",
+                        );
+                    }
+                    Capture::Cancelled => {
+                        state.recording = false;
+                    }
+                    Capture::Rejected(msg) => {
+                        state.message = Some((msg, true));
+                    }
+                    Capture::Captured(spec) => {
+                        state.hotkey_spec = spec;
+                        state.recording = false;
+                        state.message = None;
+                    }
+                }
             }
-            Capture::Cancelled => {
-                state.recording = false;
-            }
-            Capture::Rejected(msg) => {
-                state.message = Some((msg, true));
-            }
-            Capture::Captured(spec) => {
-                state.hotkey_spec = spec;
-                state.recording = false;
-                state.message = None;
-            }
-        }
-    }
 
-    ui.add_space(12.0);
-    ui.checkbox(&mut state.autostart, "Start with Windows");
+            ui.add_space(12.0);
+            ui.checkbox(&mut state.autostart, "Start with Windows");
+            ui.add_space(6.0);
+            ui.checkbox(&mut state.lock_on_exit, "Lock vault on exit");
 
-    ui.add_space(12.0);
-    if let Some((msg, is_error)) = &state.message {
-        ui.colored_label(if *is_error { ERROR_COLOR } else { OK_COLOR }, msg.as_str());
-        ui.add_space(8.0);
-    }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label("Max visible items:");
+                if ui.button("+").clicked() {
+                    state.max_visible_items =
+                        (state.max_visible_items + 1).min(MAX_VISIBLE_ITEMS);
+                }
+                ui.monospace(state.max_visible_items.to_string());
+                if ui.button("-").clicked() {
+                    state.max_visible_items =
+                        state.max_visible_items.saturating_sub(1).max(MIN_VISIBLE_ITEMS);
+                }
+            });
 
-    ui.horizontal(|ui| {
-        if ui.button("Save").clicked() {
-            action = Action::Save;
-        }
-        if ui.button("Cancel").clicked() {
-            action = Action::Cancel;
-        }
-    });
+            ui.add_space(12.0);
+            if let Some((msg, is_error)) = &state.message {
+                ui.colored_label(if *is_error { ERROR_COLOR } else { OK_COLOR }, msg.as_str());
+            }
+        });
 
     action
 }

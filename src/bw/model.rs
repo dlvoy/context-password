@@ -27,6 +27,12 @@ pub struct RawLogin {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    /// The raw TOTP seed, if the item has one configured. Never read
+    /// directly — only its presence matters (`Entry::has_totp`); the actual
+    /// current code is fetched from `bw get totp` at time of use, never
+    /// computed from this locally (see `bw::cmd::get_totp`'s doc).
+    #[serde(default)]
+    pub totp: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -40,10 +46,7 @@ pub struct RawUri {
     pub match_type: Option<u8>,
 }
 
-/// One entry in the in-memory popup cache. `id`/`username`/`password` are
-/// unused until M5 wires up the real popup list and autotype; `ord` and
-/// `name` already drive the M4 debug log (`log_line`) and the sort order.
-#[allow(dead_code)]
+/// One entry in the in-memory popup cache.
 pub struct Entry {
     pub id: String,
     pub name: String,
@@ -55,6 +58,11 @@ pub struct Entry {
     /// self-correcting.
     pub ord: Option<i64>,
     pub password: Secret,
+    /// Whether the item has a TOTP seed configured — checked before ever
+    /// attempting `bw get totp`, so asking for a code on an item that
+    /// doesn't have one is an immediate inline error, not a doomed
+    /// subprocess call.
+    pub has_totp: bool,
 }
 
 impl Entry {
