@@ -3,10 +3,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod bw;
 mod config;
 mod hotkey;
 mod msg;
+mod secret;
 mod tray;
+mod ui;
 mod win;
 
 use eframe::egui;
@@ -58,7 +61,7 @@ fn main() {
     if let Err(e) = eframe::run_native(
         "context-password",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, hotkey)?))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, hotkey, cfg)?))),
     ) {
         eprintln!("eframe exited with an error: {e}");
     }

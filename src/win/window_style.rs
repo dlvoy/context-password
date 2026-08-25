@@ -41,11 +41,12 @@ pub fn make_tool_window(hwnd: HWND) {
     }
 }
 
-/// Positions the window in physical pixels while leaving it hidden and
-/// unactivated (`SWP_NOACTIVATE`) and without a redraw of the old position
-/// (`SWP_NOREDRAW`) — this is frame N of the plan's three-frame show
-/// sequence (§2). Naive offset-from-cursor placement only; monitor-aware
-/// flip-and-clamp is M6's `win/monitor.rs`.
+/// Positions and sizes the window in physical pixels while leaving it
+/// hidden and unactivated (`SWP_NOACTIVATE`) and without a redraw of the
+/// old position (`SWP_NOREDRAW`) — this is frame N of the plan's
+/// three-frame show sequence (§2). Pass the output of
+/// `win::monitor::placement_for`, which handles which monitor, DPI
+/// scaling, and keeping the window on-screen.
 pub fn place(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
     unsafe {
         SetWindowPos(

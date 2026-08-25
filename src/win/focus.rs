@@ -1,4 +1,4 @@
-//! Foreground-window capture and self-activation for the popup.
+//! Foreground-window capture, activation, and restoration.
 //!
 //! See the plan's F1/F2 findings: `global-hotkey`'s handler runs
 //! synchronously inside the wndproc during `DispatchMessage` on the UI
@@ -15,37 +15,41 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
-    GetWindowThreadProcessId, GUITHREADINFO, SetForegroundWindow,
+    BringWindowToTop, GUITHREADINFO, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
+    GetWindowThreadProcessId, IsIconic, IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
+
+use super::integrity;
 
 /// The window that had focus immediately before the popup was summoned,
 /// plus enough context to restore it later and to place the popup now.
 /// `hwnd`/`focus_child` are stored as `isize` rather than `HWND` so `Target`
 /// is `Send` — it travels through the app's `mpsc` channel.
-///
-/// `thread_id` and `focus_child` are captured now but only consumed from M3
-/// onward (the `AttachThreadInput` fallback and `SetFocus(focus_child)` in
-/// the typing sequence's `Activate` phase) — captured here because they can
-/// only be read at hotkey time, not retroactively when M3 needs them.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub struct Target {
     pub hwnd: isize,
     pub thread_id: u32,
     pub focus_child: isize,
     pub cursor: (i32, i32),
+    /// Whether this window's process runs at a higher integrity level than
+    /// ours (plan §5/F11) — if so, `SendInput` targeting it will be
+    /// silently dropped by UIPI, so delivery must refuse to type rather
+    /// than fail invisibly.
+    pub elevated_beyond_us: bool,
 }
 
 /// Captures the current foreground window and cursor position. Must be
-/// called synchronously from the hotkey handler.
+/// called synchronously from the hotkey handler. `our_integrity_rid` is
+/// read once at startup (`integrity::our_integrity_rid`) and passed in
+/// rather than re-read here, since it never changes for the process's
+/// lifetime.
 ///
 /// Returns `None` if the foreground window belongs to this process — a
-/// repeat press while the popup already has focus. M2 treats that as a
+/// repeat press while the popup already has focus. This is treated as a
 /// no-op rather than falling back to a remembered target; that refinement
 /// ("keep the last good target so a double press doesn't clobber it", per
 /// the plan) can wait until it's actually needed.
-pub fn capture_target() -> Option<Target> {
+pub fn capture_target(our_integrity_rid: u32) -> Option<Target> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.is_null() {
@@ -78,6 +82,7 @@ pub fn capture_target() -> Option<Target> {
             thread_id,
             focus_child,
             cursor: (pt.x, pt.y),
+            elevated_beyond_us: integrity::target_is_higher(pid, our_integrity_rid),
         })
     }
 }
@@ -129,11 +134,40 @@ pub fn activate_self(hwnd: HWND) -> ActivationResult {
     }
 }
 
-/// Best-effort restore of the target's foreground status. M2 scope only —
-/// no verification/retry loop or `AttachThreadInput` dance; that lands in
-/// M3 alongside the typing sequence (`DrainModifiers`/`VerifyForeground`).
-pub fn restore_target(target: &Target) {
+/// Makes `target.hwnd` the foreground window again and restores its
+/// previously focused child control. Used both for the Esc/blur dismiss
+/// path and as the `Activate` phase of the typing delivery sequence (plan
+/// §4) — unlike `activate_self`, this also un-minimizes the window and
+/// re-applies the child that had focus, since the goal is to put the user
+/// back exactly where they were, not just to raise a window.
+pub fn activate_target(target: &Target) {
     unsafe {
-        SetForegroundWindow(target.hwnd as HWND);
+        let hwnd = target.hwnd as HWND;
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        if SetForegroundWindow(hwnd) == 0 || GetForegroundWindow() != hwnd {
+            let my_tid = GetCurrentThreadId();
+            if target.thread_id != 0 && target.thread_id != my_tid {
+                AttachThreadInput(my_tid, target.thread_id, 1);
+                SetForegroundWindow(hwnd);
+                AttachThreadInput(my_tid, target.thread_id, 0);
+            }
+        }
+        if target.focus_child != 0 {
+            SetFocus(target.focus_child as HWND);
+        }
     }
+}
+
+/// Whether `hwnd` still refers to a live window — a target may have closed
+/// in the time it took to pick an item from the popup.
+pub fn is_window(hwnd: isize) -> bool {
+    unsafe { IsWindow(hwnd as HWND) != 0 }
+}
+
+/// Whether `hwnd` is currently the foreground window — the poll
+/// `VerifyForeground` (plan §4) uses instead of a blind sleep.
+pub fn is_foreground(hwnd: isize) -> bool {
+    unsafe { GetForegroundWindow() as isize == hwnd }
 }
