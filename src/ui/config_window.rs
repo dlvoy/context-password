@@ -33,6 +33,10 @@ pub struct ConfigWindowState {
     pub recording: bool,
     pub autostart: bool,
     pub lock_on_exit: bool,
+    /// Whether the vault should prompt for the master password
+    /// automatically a while after startup (`UnlockMode::Delayed`) or only
+    /// once the popup is first opened (`UnlockMode::Lazy`).
+    pub auto_unlock: bool,
     pub max_visible_items: u32,
     pub message: Option<(String, bool)>,
     /// Physical modifier keys currently held while recording, tracked by
@@ -93,9 +97,12 @@ pub fn draw(ui: &mut egui::Ui, state: &mut ConfigWindowState) -> Action {
     egui::Panel::bottom("settings_footer")
         .show_separator_line(true)
         .show(ui, |ui| {
-            ui.add_space(8.0);
+            // Uniform on all four sides — left of Cancel, right of Save,
+            // and above the row all match the gap already below it (the
+            // panel's own bottom edge), instead of the wider left/right
+            // margin used elsewhere in the dialog.
             egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(BODY_MARGIN as i8, 8))
+                .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
                     let (cancel_clicked, save_clicked) = egui::Sides::new().show(
                         ui,
@@ -126,7 +133,7 @@ pub fn draw(ui: &mut egui::Ui, state: &mut ConfigWindowState) -> Action {
                 },
                 |ui| {
                     let label = if state.recording {
-                        "Press a key combination…"
+                        "Enter hotkeys…"
                     } else {
                         "Record…"
                     };
@@ -163,6 +170,8 @@ pub fn draw(ui: &mut egui::Ui, state: &mut ConfigWindowState) -> Action {
 
             ui.add_space(12.0);
             ui.checkbox(&mut state.autostart, "Start with Windows");
+            ui.add_space(6.0);
+            ui.checkbox(&mut state.auto_unlock, "Auto-unlock at start");
             ui.add_space(6.0);
             ui.checkbox(&mut state.lock_on_exit, "Lock vault on exit");
 

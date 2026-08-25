@@ -63,7 +63,11 @@ const FOREGROUND_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
 /// cadence — total delivery latency is a few hundred ms, not a few ms.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const POPUP_SIZE: (i32, i32) = (340, 220);
-const SETTINGS_SIZE: (i32, i32) = (380, 300);
+// Hand-tuned to comfortably fit every row (hotkey recorder, three
+// checkboxes, the max-visible-items stepper, and the footer) at the
+// dialog's scaled-up font size (`config_window::FONT_SCALE`) with no
+// clipping or crowding.
+const SETTINGS_SIZE: (i32, i32) = (460, 420);
 /// Bounds for the `ShowingList` popup's content-fitted width (see
 /// `measure_list_width`) — never narrower than the other screens, and never
 /// so wide that one absurdly long item name blows the popup up.
@@ -128,6 +132,11 @@ enum Content {
     Prompting {
         password: Zeroizing<String>,
         error: Option<String>,
+        /// Whether the field is showing plaintext instead of bullets —
+        /// still never an `egui::TextEdit` (see the module doc's F6 note),
+        /// so revealing it doesn't reopen the leak that avoiding `TextEdit`
+        /// was for; it's a plain painted label either way.
+        revealed: bool,
     },
     Unlocking,
     /// Waiting on `bw lock` to finish — shown instead of leaving the popup
@@ -231,6 +240,7 @@ impl PopupState {
         Content::Prompting {
             password: Zeroizing::new(String::with_capacity(256)),
             error: None,
+            revealed: false,
         }
     }
 }
@@ -427,17 +437,15 @@ impl App {
     /// path, with no cursor context). Content is decided once, here, from
     /// whichever cache state currently holds — not re-decided every frame.
     fn open_popup(&mut self, target: Option<Target>) {
-        if self.delivery.is_some()
-            || matches!(
-                self.popup.content,
-                Content::Settings(_) | Content::FetchingOtp { .. }
-            )
-        {
-            // Never interrupt a delivery already in flight, a Settings
-            // screen the user has open, or an in-flight OTP fetch — a
-            // stray tray "Show" or (while a hotkey change is mid-edit) even
-            // the live hotkey firing should not silently discard an
-            // in-progress edit or lose a code that's about to arrive.
+        if self.popup.phase != ShowPhase::Hidden || self.delivery.is_some() {
+            // Never interrupt a popup that's already showing something —
+            // Settings, an in-flight OTP fetch, the master-password prompt
+            // mid-type, all of it — regardless of what asked for a new one
+            // (hotkey, tray Show, or the delayed-unlock timer firing while
+            // the user is already looking at the popup it summoned). Nor a
+            // delivery already in flight, which hides the popup itself
+            // (phase is `Hidden` there) but is just as much "already doing
+            // something."
             return;
         }
         self.popup.target = target;
@@ -527,6 +535,16 @@ impl App {
                 self.set_vault_state(VaultState::Unlocked);
                 if matches!(self.popup.content, Content::Unlocking) {
                     self.popup.content = Content::ShowingList { selected: 0, message: None };
+                    if self.popup.phase == ShowPhase::Shown {
+                        // The window is already placed/sized for the
+                        // smaller Prompting/Unlocking screen — re-enter
+                        // Placing so it picks up the list's own (dynamic)
+                        // width and height instead of keeping whatever size
+                        // it had before this switch. When the popup was
+                        // hidden instead, no fix-up is needed: `open_popup`
+                        // always re-places from scratch next time.
+                        self.popup.phase = ShowPhase::Placing;
+                    }
                 }
             }
             BwResult::Failed { stage, message } => {
@@ -536,6 +554,7 @@ impl App {
                         self.popup.content = Content::Prompting {
                             password: Zeroizing::new(String::with_capacity(256)),
                             error: Some(format!("{stage}: {message}")),
+                            revealed: false,
                         };
                     }
                     Content::FetchingOtp { selected } => {
@@ -679,7 +698,7 @@ impl App {
         let mut action = Action::None;
 
         match &mut self.popup.content {
-            Content::Prompting { password, error } => {
+            Content::Prompting { password, error, .. } => {
                 ctx.input(|i| {
                     for event in &i.events {
                         match event {
@@ -883,6 +902,7 @@ impl App {
             recording: false,
             autostart: win::autostart::is_enabled(),
             lock_on_exit: self.cfg.lock_on_exit,
+            auto_unlock: self.cfg.unlock_mode == UnlockMode::Delayed,
             // Clamped, not the raw field: a config saved before this
             // setting existed (or hand-edited) could carry a value outside
             // the widget's 3..=10 range, which must never be what the
@@ -929,7 +949,16 @@ impl App {
             }
         }
 
-        // Neither of these can fail — just record and save.
+        // Neither of these can fail — just record and save. Takes effect
+        // next launch only: the delayed-unlock timer (if any) was already
+        // spawned in `App::new` for this session and has no way to learn
+        // the setting changed underneath it.
+        let new_unlock_mode =
+            if state.auto_unlock { UnlockMode::Delayed } else { UnlockMode::Lazy };
+        if new_unlock_mode != self.cfg.unlock_mode {
+            eprintln!("settings: auto-unlock at start {}", state.auto_unlock);
+            self.cfg.unlock_mode = new_unlock_mode;
+        }
         if state.lock_on_exit != self.cfg.lock_on_exit {
             eprintln!(
                 "settings: lock on exit {}",
@@ -1097,12 +1126,15 @@ impl eframe::App for App {
         enum PostAction {
             Hide,
             Save(ConfigWindowState),
+            Deliver(DeliveryKind),
         }
         let mut post_action = None;
 
         match &mut self.popup.content {
-            Content::Prompting { password, error } => {
-                crate::ui::popup::prompting(ui, password.chars().count(), error.as_deref());
+            Content::Prompting { password, error, revealed } => {
+                if crate::ui::popup::prompting(ui, password, *revealed, error.as_deref()) {
+                    *revealed = !*revealed;
+                }
             }
             Content::Unlocking => crate::ui::popup::busy(ui, "Unlocking vault…"),
             Content::Locking => crate::ui::popup::busy(ui, "Locking vault…"),
@@ -1116,7 +1148,7 @@ impl eframe::App for App {
                 let entries = &all_entries[..all_entries.len().min(max_visible)];
                 let hidden_by_cap = all_entries.len().saturating_sub(max_visible);
                 let elevated = self.popup.target.is_some_and(|t| t.elevated_beyond_us);
-                let icon_mode = DeliveryKind::from_modifiers(ui.input(|i| i.modifiers)).icon_mode();
+                let kind = DeliveryKind::from_modifiers(ui.input(|i| i.modifiers));
                 if let Some(clicked) = crate::ui::popup::showing_list(
                     ui,
                     entries,
@@ -1126,11 +1158,14 @@ impl eframe::App for App {
                         hidden_by_cap,
                         message: message.as_deref(),
                         target_elevated: elevated,
-                        icon_mode,
+                        icon_mode: kind.icon_mode(),
                     },
                 ) {
+                    // A click is a select-and-deliver, same as Enter or a
+                    // digit — not just a selection change.
                     *selected = clicked;
                     *message = None;
+                    post_action = Some(PostAction::Deliver(kind));
                 }
             }
             Content::Settings(state) => {
@@ -1184,6 +1219,7 @@ impl eframe::App for App {
                     }
                 }
             },
+            Some(PostAction::Deliver(kind)) => self.start_delivery(kind),
         }
     }
 }

@@ -72,14 +72,19 @@ fn frame<R>(ui: &mut egui::Ui, hint: &str, body: impl FnOnce(&mut egui::Ui) -> R
         .inner
 }
 
-pub fn prompting(ui: &mut egui::Ui, char_count: usize, error: Option<&str>) {
+/// Returns `true` if the reveal-toggle eye was clicked this frame — the
+/// caller (`App::ui`) owns the `revealed` bool, since it's part of
+/// `Content::Prompting`.
+pub fn prompting(ui: &mut egui::Ui, password: &str, revealed: bool, error: Option<&str>) -> bool {
+    let mut toggled = false;
     frame(ui, "Enter to unlock  ·  Esc to dismiss", |ui| {
         ui.label("Master password:");
-        super::password_field::draw(ui, char_count);
+        toggled = super::password_field::draw(ui, password, revealed);
         if let Some(err) = error {
             ui.colored_label(ERROR_COLOR, err);
         }
     });
+    toggled
 }
 
 /// A spinner plus a message — used for every "waiting on a background `bw`

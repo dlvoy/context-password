@@ -23,9 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Number keys 1–9 and 0 jump straight to an item in the list and type it immediately, matching a numbered badge on each row.
 - A "Max visible items" control and a "Lock vault on exit" option in Settings.
 - Visible progress in the popup while the vault is being locked.
+- A reveal-toggle eye icon on the password field, to check what you've typed before pressing Enter.
+- "Auto-unlock at start" is now a Settings checkbox (on by default) instead of a config file setting.
 
 ### Changed
 
 - The tray's Show item is labeled "Unlock" until the vault has been unlocked, and Lock only appears once it has.
 - The item list is capped to a configurable number of rows (4 by default) instead of showing everything at once.
 - The Settings window has larger text, more padding, and a Save/Cancel row pinned to the bottom.
+- The Settings window is bigger and its padding more consistent around the Save/Cancel row.
+- Clicking an item in the list now delivers it immediately, the same as pressing Enter or its number key.
+
+### Fixed
+
+- The popup no longer resets to an empty prompt if the delayed auto-unlock timer fires while you're already typing the master password.
+- The item list is now sized correctly right after unlocking, instead of only from the next time the popup opens.
