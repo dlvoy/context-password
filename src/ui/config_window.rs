@@ -20,6 +20,10 @@ const LISTENING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xcc, 0x88, 0x00)
 /// at egui's defaults, this is specifically "bigger fonts" for Settings.
 const FONT_SCALE: f32 = 1.25;
 const BODY_MARGIN: f32 = 16.0;
+/// Extra room inside every button in this dialog — egui's default padding
+/// reads as cramped once the text itself is scaled up.
+const BUTTON_PADDING: egui::Vec2 = egui::Vec2::new(12.0, 8.0);
+const STEP_BUTTON_WIDTH: f32 = 32.0;
 
 /// Working copy of the settings being edited — separate from the live
 /// `Config` until Save is clicked, so a cancelled dialog changes nothing.
@@ -75,10 +79,14 @@ pub fn draw(ui: &mut egui::Ui, state: &mut ConfigWindowState) -> Action {
 
     // Scale this Ui's text styles up for the whole dialog — done once here
     // rather than per-widget, and as a ratio (not a fixed size) so headings
-    // stay bigger than body text instead of flattening the hierarchy.
-    for font_id in ui.style_mut().text_styles.values_mut() {
+    // stay bigger than body text instead of flattening the hierarchy. Also
+    // bump button padding — the default reads as cramped once button text
+    // itself is bigger too.
+    let style = ui.style_mut();
+    for font_id in style.text_styles.values_mut() {
         font_id.size *= FONT_SCALE;
     }
+    style.spacing.button_padding = BUTTON_PADDING;
 
     let mut action = Action::None;
 
@@ -106,24 +114,29 @@ pub fn draw(ui: &mut egui::Ui, state: &mut ConfigWindowState) -> Action {
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(BODY_MARGIN as i8)))
         .show(ui, |ui| {
-            ui.heading("context-password — Settings");
+            ui.heading("Context Password | Settings");
             ui.separator();
             ui.add_space(8.0);
 
             ui.label("Global hotkey:");
-            ui.horizontal(|ui| {
-                ui.monospace(&state.hotkey_spec);
-                let label = if state.recording {
-                    "Press a key combination…"
-                } else {
-                    "Record…"
-                };
-                if ui.button(label).clicked() && !state.recording {
-                    state.recording = true;
-                    state.message = None;
-                    state.held = HeldMods::default();
-                }
-            });
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.monospace(&state.hotkey_spec);
+                },
+                |ui| {
+                    let label = if state.recording {
+                        "Press a key combination…"
+                    } else {
+                        "Record…"
+                    };
+                    if ui.button(label).clicked() && !state.recording {
+                        state.recording = true;
+                        state.message = None;
+                        state.held = HeldMods::default();
+                    }
+                },
+            );
 
             if state.recording {
                 let events = ui.input(|i| i.events.clone());
@@ -156,14 +169,15 @@ pub fn draw(ui: &mut egui::Ui, state: &mut ConfigWindowState) -> Action {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.label("Max visible items:");
-                if ui.button("+").clicked() {
-                    state.max_visible_items =
-                        (state.max_visible_items + 1).min(MAX_VISIBLE_ITEMS);
-                }
-                ui.monospace(state.max_visible_items.to_string());
-                if ui.button("-").clicked() {
+                let button = |text| egui::Button::new(text).min_size(egui::vec2(STEP_BUTTON_WIDTH, 0.0));
+                if ui.add(button("-")).clicked() {
                     state.max_visible_items =
                         state.max_visible_items.saturating_sub(1).max(MIN_VISIBLE_ITEMS);
+                }
+                ui.monospace(state.max_visible_items.to_string());
+                if ui.add(button("+")).clicked() {
+                    state.max_visible_items =
+                        (state.max_visible_items + 1).min(MAX_VISIBLE_ITEMS);
                 }
             });
 

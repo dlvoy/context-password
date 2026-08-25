@@ -64,6 +64,11 @@ const FOREGROUND_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const POPUP_SIZE: (i32, i32) = (340, 220);
 const SETTINGS_SIZE: (i32, i32) = (380, 300);
+/// Bounds for the `ShowingList` popup's content-fitted width (see
+/// `measure_list_width`) — never narrower than the other screens, and never
+/// so wide that one absurdly long item name blows the popup up.
+const LIST_MIN_WIDTH: f32 = POPUP_SIZE.0 as f32;
+const LIST_MAX_WIDTH: f32 = 520.0;
 /// Non-list chrome above/below the item rows in `ShowingList` (title,
 /// separators, hint footer, spacing) — hand-tuned the same way `POPUP_SIZE`
 /// itself was, revisit if the list ever looks cramped or has dead space at
@@ -569,6 +574,12 @@ impl App {
                     .and_then(|(entries, _)| entries.get(selected))
                     .map(Entry::log_line)
                     .unwrap_or_default();
+                // `begin_delivery` itself never touches `popup.content` (the
+                // Password/Username callers already leave it as
+                // `ShowingList`) — reset it here first, or it would stay
+                // `FetchingOtp` forever, which `open_popup` treats the same
+                // as `Settings`: refuses to ever reopen the popup again.
+                self.popup.content = Content::ShowingList { selected, message: None };
                 self.begin_delivery(target, code, &log_line);
             }
         }
@@ -711,6 +722,10 @@ impl App {
                     .as_ref()
                     .map_or(0, |(e, _)| e.len().min(self.cfg.effective_max_visible()));
                 let mut moved = false;
+                // A digit is a quick-select *and* deliver in one press (like
+                // clicking the row then pressing Enter) — distinct from
+                // Arrow/Home/End, which only move the selection.
+                let mut digit_selected = false;
                 if count > 0 {
                     if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                         *selected = (*selected + 1) % count;
@@ -735,12 +750,13 @@ impl App {
                     if let Some(i) = digit_pressed(ctx).filter(|&i| i < count) {
                         *selected = i;
                         moved = true;
+                        digit_selected = true;
                     }
                 }
                 if moved {
                     *message = None;
                 }
-                if enter && count > 0 {
+                if (enter || digit_selected) && count > 0 {
                     let kind = DeliveryKind::from_modifiers(ctx.input(|i| i.modifiers));
                     action = Action::Deliver(kind);
                 } else if escape || blurred {
@@ -867,7 +883,11 @@ impl App {
             recording: false,
             autostart: win::autostart::is_enabled(),
             lock_on_exit: self.cfg.lock_on_exit,
-            max_visible_items: self.cfg.max_visible_items,
+            // Clamped, not the raw field: a config saved before this
+            // setting existed (or hand-edited) could carry a value outside
+            // the widget's 3..=10 range, which must never be what the
+            // widget starts at.
+            max_visible_items: self.cfg.effective_max_visible() as u32,
             message: None,
             held: config_window::HeldMods::default(),
         });
@@ -1012,7 +1032,14 @@ impl eframe::App for App {
                     // recorder, checkbox, and buttons.
                     Content::Settings(_) => SETTINGS_SIZE,
                     Content::ShowingList { .. } => {
-                        (POPUP_SIZE.0, list_popup_height(self.cfg.effective_max_visible()))
+                        let max_visible = self.cfg.effective_max_visible();
+                        let width = self.cached_entries.as_ref().map_or(POPUP_SIZE.0, |(e, _)| {
+                            let visible = &e[..e.len().min(max_visible)];
+                            crate::ui::popup::measure_list_width(ctx, visible)
+                                .clamp(LIST_MIN_WIDTH, LIST_MAX_WIDTH)
+                                .round() as i32
+                        });
+                        (width, list_popup_height(max_visible))
                     }
                     _ => POPUP_SIZE,
                 };

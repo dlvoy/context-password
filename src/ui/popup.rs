@@ -24,6 +24,12 @@ const ICON_SIZE: f32 = 16.0;
 const ICON_LEFT_INSET: f32 = 10.0;
 const BADGE_SIZE: f32 = 18.0;
 const BADGE_RIGHT_INSET: f32 = 10.0;
+const TEXT_TO_BADGE_GAP: f32 = 8.0;
+/// Rough chrome outside a row's own icon/text/badge geometry (the panel's
+/// default margins, plus a bit of breathing room) — not exact, since
+/// nothing outside a live paint pass can be, just enough that a
+/// width computed from `measure_list_width` doesn't feel tight.
+const OUTER_MARGIN: f32 = 24.0;
 
 /// Which field Enter/a digit would deliver right now, driven by which
 /// modifier is held (plain / Shift / Alt) — the render counterpart of
@@ -54,7 +60,11 @@ fn frame<R>(ui: &mut egui::Ui, hint: &str, body: impl FnOnce(&mut egui::Ui) -> R
     egui::CentralPanel::default()
         .show(ui, |ui| {
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("context-password").size(TITLE_SIZE).strong());
+            ui.label(
+                egui::RichText::new("Context Password for Bitwarden")
+                    .size(TITLE_SIZE)
+                    .strong(),
+            );
             ui.separator();
             ui.add_space(6.0);
             body(ui)
@@ -112,12 +122,7 @@ pub fn showing_list(
     selected: usize,
     info: ListInfo<'_>,
 ) -> Option<usize> {
-    let hint = match info.icon_mode {
-        IconMode::Password => "Up/Down · Enter types password · Esc dismisses",
-        IconMode::Username => "Up/Down · Enter types username · Esc dismisses",
-        IconMode::Otp => "Up/Down · Enter types one-time code · Esc dismisses",
-    };
-    frame(ui, hint, |ui| {
+    frame(ui, hint_for(info.icon_mode), |ui| {
         let mut clicked = None;
         if entries.is_empty() {
             ui.label("No items tagged for this app yet.");
@@ -153,6 +158,54 @@ pub fn showing_list(
         }
         clicked
     })
+}
+
+fn hint_for(icon_mode: IconMode) -> &'static str {
+    match icon_mode {
+        IconMode::Password => "Up/Down · Enter types password · Esc dismisses",
+        IconMode::Username => "Up/Down · Enter types username · Esc dismisses",
+        IconMode::Otp => "Up/Down · Enter types one-time code · Esc dismisses",
+    }
+}
+
+/// Width (in points) `text` takes at `font_size`, from font metrics alone —
+/// no live `Ui`/paint pass needed, so this works from `App::logic` (before
+/// the popup is ever shown — `ui()` doesn't run on a hidden window) to size
+/// the window to fit its content.
+fn measure_text_width(ctx: &egui::Context, text: &str, font_size: f32) -> f32 {
+    ctx.fonts_mut(|f| {
+        f.layout_no_wrap(
+            text.to_string(),
+            egui::FontId::proportional(font_size),
+            egui::Color32::WHITE, // Doesn't affect layout size.
+        )
+    })
+    .size()
+    .x
+}
+
+/// The popup width `showing_list` needs to show every one of `entries`'
+/// labels, and any of the hint lines, without truncation — the widest row
+/// (icon column + text + badge column, matching `list_row`'s actual
+/// geometry) or hint, plus outer chrome.
+pub fn measure_list_width(ctx: &egui::Context, entries: &[Entry]) -> f32 {
+    let mut widest = 0.0f32;
+    for entry in entries {
+        let label = match &entry.username {
+            Some(u) => format!("{} ({u})", entry.name),
+            None => entry.name.clone(),
+        };
+        let row_width = ITEM_TEXT_INSET
+            + measure_text_width(ctx, &label, ITEM_FONT_SIZE)
+            + TEXT_TO_BADGE_GAP
+            + BADGE_SIZE
+            + BADGE_RIGHT_INSET;
+        widest = widest.max(row_width);
+    }
+    for mode in [IconMode::Password, IconMode::Username, IconMode::Otp] {
+        widest = widest.max(measure_text_width(ctx, hint_for(mode), HINT_SIZE));
+    }
+    widest + OUTER_MARGIN
 }
 
 /// The quick-select digit for row `i`: `'1'..'9'` then `'0'` for the 10th —
@@ -226,23 +279,27 @@ fn paint_icon(painter: &egui::Painter, row_rect: egui::Rect, mode: IconMode, col
     let stroke = egui::Stroke::new(1.5, color);
     match mode {
         IconMode::Password => {
-            // A key: a ring for the bow, a shaft, two teeth.
-            let bow_r = ICON_SIZE * 0.28;
-            let bow_center = center + egui::vec2(-ICON_SIZE * 0.22, 0.0);
-            painter.circle_stroke(bow_center, bow_r, stroke);
-            let shaft_start = bow_center + egui::vec2(bow_r, 0.0);
-            let shaft_end = center + egui::vec2(ICON_SIZE * 0.42, 0.0);
-            painter.line_segment([shaft_start, shaft_end], stroke);
-            for dx in [-0.14, -0.02] {
-                let tooth_x = shaft_end.x + ICON_SIZE * dx;
-                painter.line_segment(
-                    [
-                        egui::pos2(tooth_x, shaft_end.y),
-                        egui::pos2(tooth_x, shaft_end.y + ICON_SIZE * 0.22),
-                    ],
-                    stroke,
-                );
-            }
+            // A keyhole (circle over a tapered triangle) rather than a
+            // literal key silhouette — a thin stroked key shape didn't read
+            // clearly at this size; a keyhole is simpler (two filled
+            // shapes, no thin strokes to lose in anti-aliasing) and at
+            // least as standard a "password" glyph in flat icon sets.
+            let hole_r = ICON_SIZE * 0.2;
+            let hole_center = center + egui::vec2(0.0, -ICON_SIZE * 0.12);
+            painter.circle_filled(hole_center, hole_r, color);
+            let top_half_width = hole_r * 0.65;
+            let bottom_half_width = hole_r * 0.32;
+            let bottom_y = hole_center.y + ICON_SIZE * 0.38;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(hole_center.x - top_half_width, hole_center.y),
+                    egui::pos2(hole_center.x + top_half_width, hole_center.y),
+                    egui::pos2(hole_center.x + bottom_half_width, bottom_y),
+                    egui::pos2(hole_center.x - bottom_half_width, bottom_y),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
         }
         IconMode::Username => {
             // A person: a head (circle) over shoulders (an arc-ish curve
