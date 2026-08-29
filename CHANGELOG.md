@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-30
+
+### Added
+
+- A small progress indicator near the cursor while autotype is running: a keyboard icon while typing is in progress, then a green checkmark for a couple of seconds once it's done.
+
+### Fixed
+
+- Pressing Shift+1 in the item list now types the selected item's username, matching every other Shift+digit combination.
+- A brief empty window no longer flashes near the top-left of the screen when the app starts.
+
 ## [1.0.1] - 2026-08-25
 
 ### Fixed
