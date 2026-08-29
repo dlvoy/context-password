@@ -388,6 +388,8 @@ impl App {
             },
         )?;
         win::window_style::make_tool_window(hwnd);
+        // Before the first paint — see `park_offscreen`'s doc for why.
+        win::window_style::park_offscreen(hwnd);
 
         // `ThemePreference::System` is egui's default already, so this is
         // just making the intent explicit — egui reads the OS theme from
@@ -1111,7 +1113,8 @@ impl eframe::App for App {
     }
 
     /// Runs every frame regardless of whether the root window is visible —
-    /// unlike `ui`, which eframe skips entirely while hidden. This is where
+    /// unlike `ui`, which draws only while `Shown` (see its own doc for why
+    /// that's an early return here, not an eframe guarantee). This is where
     /// all inbound events (tray, hotkey, `bw` worker) get drained, and
     /// where the show/hide and delivery phase machines advance.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1119,7 +1122,8 @@ impl eframe::App for App {
             self.hidden_after_startup = true;
             // eframe's glow backend always reveals the root window after its
             // first rendered frame, regardless of the ViewportBuilder's
-            // `with_visible(false)` — see M1's finding in window_style.rs.
+            // `with_visible(false)` — see `window_style::park_offscreen`,
+            // which keeps that one unavoidable frame off-screen.
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
@@ -1226,8 +1230,12 @@ impl eframe::App for App {
         self.advance_delivery(ctx);
     }
 
-    /// Only ever runs while `Shown` — eframe skips `ui` entirely for a
-    /// hidden window, and the earlier phases have nothing to draw yet.
+    /// Only ever draws while `Shown` (the earlier phases have nothing to
+    /// draw yet) — note this is enforced by the early return below, not by
+    /// eframe: contrary to `logic`'s doc, eframe's glow backend derives
+    /// visibility from `ViewportInfo::visible()`, which `egui-winit` never
+    /// populates (it doesn't set `occluded`), so eframe actually runs a
+    /// full paint every tick even while the window is hidden.
     ///
     /// `Content::Settings` is the one variant here that both draws *and*
     /// decides on an action (Save/Cancel), unlike the others where

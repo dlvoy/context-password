@@ -5,9 +5,13 @@
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOREDRAW,
+    GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOSIZE,
     SetWindowLongPtrW, SetWindowPos, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
+
+/// The coordinate Windows itself parks minimized windows at — known-safe
+/// off any monitor layout.
+const OFFSCREEN_ORIGIN: i32 = -32000;
 
 /// Extracts the raw HWND from anything exposing `raw-window-handle` (eframe's
 /// `CreationContext` and `Frame` both do). Returns `None` on a platform where
@@ -57,6 +61,28 @@ pub fn place(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
             w,
             h,
             SWP_NOACTIVATE | SWP_NOREDRAW,
+        );
+    }
+}
+
+/// Moves the window far off any monitor, without resizing it. eframe's
+/// glow backend force-shows the root viewport for one frame after its
+/// first paint, discarding the `ViewportBuilder`'s `with_visible(false)`
+/// (see `App::new`'s call site) — that one revealed frame is otherwise a
+/// flash at winit's default `CW_USEDEFAULT` position, near the screen's
+/// top-left corner. Parking here first makes it land somewhere invisible;
+/// every real show immediately overwrites this via `place`, so it never
+/// needs to be "undone".
+pub fn park_offscreen(hwnd: HWND) {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            OFFSCREEN_ORIGIN,
+            OFFSCREEN_ORIGIN,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOSIZE,
         );
     }
 }
