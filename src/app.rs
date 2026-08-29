@@ -92,28 +92,82 @@ fn list_popup_height(max_visible: usize) -> i32 {
     (LIST_CHROME_HEIGHT + max_visible as f32 * crate::ui::popup::ITEM_ROW_HEIGHT).round() as i32
 }
 
-/// The visible-row index a quick-select digit key was just pressed for
-/// (`1`..`9` → 0..8, `0` → 9), if any — the keyboard counterpart of
-/// `ui::popup::badge_for`'s numbering.
-fn digit_pressed(ctx: &egui::Context) -> Option<usize> {
+/// `Key::Num1`..`Key::Num9` → 0..8, `Key::Num0` → 9 — the keyboard
+/// counterpart of `ui::popup::badge_for`'s numbering. `None` for any other
+/// key.
+fn digit_index(key: egui::Key) -> Option<usize> {
     use egui::Key;
-    const DIGITS: [(Key, usize); 10] = [
-        (Key::Num1, 0),
-        (Key::Num2, 1),
-        (Key::Num3, 2),
-        (Key::Num4, 3),
-        (Key::Num5, 4),
-        (Key::Num6, 5),
-        (Key::Num7, 6),
-        (Key::Num8, 7),
-        (Key::Num9, 8),
-        (Key::Num0, 9),
-    ];
-    ctx.input(|i| {
-        DIGITS
-            .iter()
-            .find(|(key, _)| i.key_pressed(*key))
-            .map(|(_, idx)| *idx)
+    match key {
+        Key::Num1 => Some(0),
+        Key::Num2 => Some(1),
+        Key::Num3 => Some(2),
+        Key::Num4 => Some(3),
+        Key::Num5 => Some(4),
+        Key::Num6 => Some(5),
+        Key::Num7 => Some(6),
+        Key::Num8 => Some(7),
+        Key::Num9 => Some(8),
+        Key::Num0 => Some(9),
+        _ => None,
+    }
+}
+
+/// Keys the popup already binds by logical name, distinct from a digit
+/// quick-select — see `digit_pressed` for why this matters.
+fn binds_by_name(key: egui::Key) -> bool {
+    use egui::Key;
+    matches!(
+        key,
+        Key::ArrowUp
+            | Key::ArrowDown
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Insert
+            | Key::Delete
+            | Key::Enter
+    )
+}
+
+/// The visible-row index a quick-select digit key was just pressed for, if
+/// any (see `digit_index`).
+///
+/// Matches on `physical_key` — the key's *position* — rather than egui's
+/// aggregated logical `key`, for the same reason `ui::config_window::
+/// capture_hotkey` does: winit folds Shift into the logical key, and
+/// `egui::Key::from_name` happens to name some shifted top-row glyphs
+/// (`!` → `Exclamationmark`) but not others (`@#$%^&*()` have no egui
+/// `Key`, so they fall back to the physical key already). Matching the
+/// logical key alone made Shift+1 a dead shortcut — on a layout where
+/// Shift+1 types `!`, no `Key::Num1` event was ever produced — while
+/// Shift+2..Shift+0 worked purely by accident of `from_name`'s gaps.
+///
+/// The `binds_by_name` guard exists because egui-winit maps both
+/// `KeyCode::Digit1` and `KeyCode::Numpad1` to the same `Key::Num1`: with
+/// NumLock off, a numpad press already has a meaning (Home/End/arrows) via
+/// its *logical* key, and a bare physical fallback would hijack it into
+/// selecting-and-delivering a row instead.
+fn digit_pressed(events: &[egui::Event]) -> Option<usize> {
+    events.iter().find_map(|event| {
+        let egui::Event::Key {
+            key,
+            physical_key,
+            pressed: true,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        if let Some(idx) = digit_index(*key) {
+            return Some(idx);
+        }
+        if binds_by_name(*key) {
+            return None;
+        }
+        physical_key.and_then(digit_index)
     })
 }
 
@@ -788,7 +842,10 @@ impl App {
                         *selected = count - 1;
                         moved = true;
                     }
-                    if let Some(i) = digit_pressed(ctx).filter(|&i| i < count) {
+                    if let Some(i) = ctx
+                        .input(|i| digit_pressed(&i.events))
+                        .filter(|&i| i < count)
+                    {
                         *selected = i;
                         moved = true;
                         digit_selected = true;
@@ -1293,5 +1350,76 @@ impl eframe::App for App {
             },
             Some(PostAction::Deliver(kind)) => self.start_delivery(kind),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_event(key: egui::Key, physical_key: Option<egui::Key>) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn plain_digit_selects_by_index() {
+        let events = [key_event(egui::Key::Num1, Some(egui::Key::Num1))];
+        assert_eq!(digit_pressed(&events), Some(0));
+    }
+
+    #[test]
+    fn shift_1_falls_back_to_physical_key() {
+        // Regression: on layouts where Shift+1 types "!", winit's logical
+        // key is `Exclamationmark`, not `Num1` — only the physical key
+        // still says "1".
+        let events = [key_event(egui::Key::Exclamationmark, Some(egui::Key::Num1))];
+        assert_eq!(digit_pressed(&events), Some(0));
+    }
+
+    #[test]
+    fn shift_2_still_works_when_logical_key_already_matches() {
+        // The accidental-success case: `egui::Key::from_name` has no entry
+        // for "@", so this already arrived as a physical fallback before
+        // the fix — must keep working after it.
+        let events = [key_event(egui::Key::Num2, Some(egui::Key::Num2))];
+        assert_eq!(digit_pressed(&events), Some(1));
+    }
+
+    #[test]
+    fn other_shifted_glyphs_fall_back_to_physical_key() {
+        // German-layout shapes: Shift+7 types "/", Shift+0 types "=".
+        let events = [key_event(egui::Key::Slash, Some(egui::Key::Num7))];
+        assert_eq!(digit_pressed(&events), Some(6));
+        let events = [key_event(egui::Key::Equals, Some(egui::Key::Num0))];
+        assert_eq!(digit_pressed(&events), Some(9));
+    }
+
+    #[test]
+    fn numlock_off_numpad_keeps_its_navigation_meaning() {
+        // Numpad 1 with NumLock off arrives logically as `End`, physically
+        // as `Num1` — must not be hijacked into a quick-select.
+        let events = [key_event(egui::Key::End, Some(egui::Key::Num1))];
+        assert_eq!(digit_pressed(&events), None);
+    }
+
+    #[test]
+    fn ignores_key_up_events() {
+        let mut event = key_event(egui::Key::Num1, Some(egui::Key::Num1));
+        if let egui::Event::Key { pressed, .. } = &mut event {
+            *pressed = false;
+        }
+        assert_eq!(digit_pressed(&[event]), None);
+    }
+
+    #[test]
+    fn ignores_non_digit_keys() {
+        let events = [key_event(egui::Key::A, Some(egui::Key::A))];
+        assert_eq!(digit_pressed(&events), None);
     }
 }
