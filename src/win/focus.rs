@@ -74,17 +74,24 @@ pub fn capture_target(our_integrity_rid: u32) -> Option<Target> {
             0
         };
 
-        let mut pt = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut pt);
-
         Some(Target {
             hwnd: hwnd as isize,
             thread_id,
             focus_child,
-            cursor: (pt.x, pt.y),
+            cursor: cursor_pos(),
             elevated_beyond_us: integrity::target_is_higher(pid, our_integrity_rid),
         })
     }
+}
+
+/// The cursor's current position. `Target::cursor` is a snapshot from
+/// hotkey-press time; this is for callers that want the live position
+/// instead — e.g. placing the autotype indicator, since the user may have
+/// moved the mouse between pressing the hotkey and picking an item.
+pub fn cursor_pos() -> (i32, i32) {
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut pt) };
+    (pt.x, pt.y)
 }
 
 /// How self-activation succeeded — the instrumentation the plan's M2 calls

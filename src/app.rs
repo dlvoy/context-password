@@ -85,6 +85,16 @@ const LIST_CHROME_HEIGHT: f32 = 100.0;
 /// before giving up and closing anyway — a hung or very slow `bw` must
 /// never make quitting feel stuck.
 const LOCK_ON_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Square size (96-DPI-equivalent points) of the autotype indicator —
+/// `win::monitor::placement_for` scales it per-monitor the same way it does
+/// `POPUP_SIZE`.
+const INDICATOR_SIZE_PT: i32 = 32;
+/// `win::typing::send_unicode` is a single non-blocking `SendInput` burst,
+/// so without a floor the keyboard glyph could flash by in under a frame —
+/// hold it at least this long regardless of how fast typing actually was.
+const INDICATOR_MIN_TYPING: Duration = Duration::from_millis(400);
+/// How long the green checkmark stays up after typing lands.
+const INDICATOR_CHECK_DURATION: Duration = Duration::from_secs(2);
 
 /// The height of a `ShowingList` popup that shows exactly `max_visible`
 /// rows, no more and no less — no dead space, no overflow.
@@ -326,6 +336,44 @@ struct Delivery {
     deadline: Instant,
 }
 
+/// The autotype indicator's state, independent of `DeliveryPhase` — it
+/// covers the whole delivery sequence (`HidePopup` through `Settle`), not
+/// just the instantaneous `SendInput` call. `typed` flips to `true` the
+/// moment text actually lands; an abort (target gone, foreground restore
+/// failed, elevated skip) never sets it and hides the indicator directly
+/// instead of going through this transition at all — a checkmark must
+/// never claim a delivery that didn't happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndicatorPhase {
+    Typing { since: Instant, typed: bool },
+    Done { until: Instant },
+}
+
+/// `None` means "hide the indicator". Pure function of its inputs, in the
+/// same spirit as `ui::config_window::capture_hotkey` and
+/// `win::monitor::place_within` — so it's unit tested directly rather than
+/// through the whole delivery machine.
+fn next_indicator_phase(phase: IndicatorPhase, now: Instant) -> Option<IndicatorPhase> {
+    match phase {
+        IndicatorPhase::Typing { since, typed } => {
+            if typed && now >= since + INDICATOR_MIN_TYPING {
+                Some(IndicatorPhase::Done {
+                    until: now + INDICATOR_CHECK_DURATION,
+                })
+            } else {
+                Some(phase)
+            }
+        }
+        IndicatorPhase::Done { until } => {
+            if now >= until {
+                None
+            } else {
+                Some(phase)
+            }
+        }
+    }
+}
+
 /// Counts which `activate_self` branch won, across repeated presses — the
 /// instrumentation M2 asks for to resolve spike S1 (does the plain
 /// `SetForegroundWindow` call reliably work, or is `AttachThreadInput`
@@ -360,6 +408,12 @@ pub struct App {
     hidden_after_startup: bool,
     popup: PopupState,
     delivery: Option<Delivery>,
+    /// The autotype progress indicator's state — `None` when hidden.
+    /// Independent of `delivery`: it must outlive `delivery` being set to
+    /// `None` the moment typing finishes, since the checkmark still has to
+    /// stay up for `INDICATOR_CHECK_DURATION` afterward (see
+    /// `advance_indicator`).
+    indicator: Option<IndicatorPhase>,
     stats: ActivationStats,
     /// The cache: populated once by a successful unlock, kept for the
     /// process's lifetime (the settled decision — see the plan's Context
@@ -491,6 +545,7 @@ impl App {
                 seen_focus: false,
             },
             delivery: None,
+            indicator: None,
             stats: ActivationStats::default(),
             cached_entries: None,
             hotkey_suspended: false,
@@ -548,6 +603,9 @@ impl App {
         }
         self.popup.phase = ShowPhase::Hidden;
         self.popup.seen_focus = false;
+        // A leftover checkmark from a delivery the user has since moved on
+        // from (by dismissing and reopening the popup) shouldn't linger.
+        self.hide_indicator();
         // Zeroize a half-typed password immediately on dismiss rather than
         // waiting for the next `open_popup` to overwrite (and so drop) it —
         // no reason for it to sit in memory for however long the popup
@@ -688,6 +746,10 @@ impl App {
             return;
         };
         let mut done = false;
+        // Only the successful `Settle` branch sets this — every abort path
+        // leaves it `false` so the indicator is hidden outright below
+        // rather than fed into the Typing->Done transition.
+        let mut typed = false;
 
         match delivery.phase {
             DeliveryPhase::HidePopup => {
@@ -739,6 +801,7 @@ impl App {
                         eprintln!(
                             "delivery: typed the selected password ({skipped} code unit(s) skipped)"
                         );
+                        typed = true;
                     }
                     done = true;
                 }
@@ -747,8 +810,61 @@ impl App {
 
         if done {
             self.delivery = None;
+            if typed {
+                if let Some(IndicatorPhase::Typing { typed, .. }) = self.indicator.as_mut() {
+                    *typed = true;
+                }
+            } else {
+                self.hide_indicator();
+            }
         } else {
             ctx.request_repaint_after(POLL_INTERVAL);
+        }
+    }
+
+    /// Shows the autotype indicator at the *live* cursor position (not
+    /// `target.cursor`, which is frozen at hotkey-press time — the user may
+    /// have moved the mouse since) as the keyboard glyph.
+    fn show_indicator(&mut self) {
+        let cursor = focus::cursor_pos();
+        let placement =
+            win::monitor::placement_for(Some(cursor), INDICATOR_SIZE_PT, INDICATOR_SIZE_PT);
+        win::indicator::show(
+            win::indicator::Kind::Typing,
+            placement.x,
+            placement.y,
+            placement.w,
+        );
+        self.indicator = Some(IndicatorPhase::Typing {
+            since: Instant::now(),
+            typed: false,
+        });
+    }
+
+    fn hide_indicator(&mut self) {
+        self.indicator = None;
+        win::indicator::hide();
+    }
+
+    /// Advances the indicator's own timer, independent of `delivery` (which
+    /// is long gone by the time the checkmark's 2 seconds run out). Mirrors
+    /// `advance_delivery`'s never-blocks, request-a-repaint-and-return
+    /// shape.
+    fn advance_indicator(&mut self, ctx: &egui::Context) {
+        let Some(phase) = self.indicator else {
+            return;
+        };
+        match next_indicator_phase(phase, Instant::now()) {
+            Some(next) => {
+                if matches!(phase, IndicatorPhase::Typing { .. })
+                    && matches!(next, IndicatorPhase::Done { .. })
+                {
+                    win::indicator::set_kind(win::indicator::Kind::Done);
+                }
+                self.indicator = Some(next);
+                ctx.request_repaint_after(POLL_INTERVAL);
+            }
+            None => self.hide_indicator(),
         }
     }
 
@@ -976,6 +1092,7 @@ impl App {
         });
         self.popup.phase = ShowPhase::Hidden;
         self.popup.seen_focus = false;
+        self.show_indicator();
     }
 
     /// Opens the settings screen in the same popup window (see
@@ -1130,6 +1247,7 @@ impl eframe::App for App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Tray(TrayCmd::Quit) => {
+                    self.hide_indicator();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Msg::Tray(TrayCmd::Show) | Msg::ShowPopup => {
@@ -1228,6 +1346,7 @@ impl eframe::App for App {
         }
 
         self.advance_delivery(ctx);
+        self.advance_indicator(ctx);
     }
 
     /// Only ever draws while `Shown` (the earlier phases have nothing to
@@ -1429,5 +1548,64 @@ mod tests {
     fn ignores_non_digit_keys() {
         let events = [key_event(egui::Key::A, Some(egui::Key::A))];
         assert_eq!(digit_pressed(&events), None);
+    }
+
+    #[test]
+    fn typing_holds_the_glyph_even_after_typed_until_the_minimum_elapses() {
+        let now = Instant::now();
+        let phase = IndicatorPhase::Typing {
+            since: now,
+            typed: true,
+        };
+        // Just short of the floor: the burst finished almost instantly,
+        // but the glyph must still be showing.
+        let next =
+            next_indicator_phase(phase, now + INDICATOR_MIN_TYPING - Duration::from_millis(1));
+        assert_eq!(next, Some(phase));
+    }
+
+    #[test]
+    fn typing_not_yet_typed_never_transitions_on_its_own() {
+        let now = Instant::now();
+        let phase = IndicatorPhase::Typing {
+            since: now,
+            typed: false,
+        };
+        // Delivery can legitimately take longer than the floor (modifier
+        // drain, foreground verify) before it ever calls `send_unicode` —
+        // that must not be mistaken for "done".
+        let next = next_indicator_phase(phase, now + INDICATOR_MIN_TYPING * 10);
+        assert_eq!(next, Some(phase));
+    }
+
+    #[test]
+    fn typed_and_past_the_floor_becomes_done() {
+        let now = Instant::now();
+        let phase = IndicatorPhase::Typing {
+            since: now,
+            typed: true,
+        };
+        let after = now + INDICATOR_MIN_TYPING;
+        match next_indicator_phase(phase, after) {
+            Some(IndicatorPhase::Done { until }) => {
+                assert_eq!(until, after + INDICATOR_CHECK_DURATION);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn done_stays_up_until_its_deadline() {
+        let until = Instant::now() + INDICATOR_CHECK_DURATION;
+        let phase = IndicatorPhase::Done { until };
+        let next = next_indicator_phase(phase, until - Duration::from_millis(1));
+        assert_eq!(next, Some(phase));
+    }
+
+    #[test]
+    fn done_hides_once_its_deadline_passes() {
+        let until = Instant::now();
+        let phase = IndicatorPhase::Done { until };
+        assert_eq!(next_indicator_phase(phase, until), None);
     }
 }
