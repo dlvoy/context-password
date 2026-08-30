@@ -12,6 +12,9 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 /// context to place relative to. Labeled "Show" or "Unlock" depending on
 /// vault state — see `TrayHandles::set_show_label`.
 pub const SHOW_ID: &str = "show";
+/// Re-runs `bw sync` + `bw list items` against the retained session and
+/// replaces the cached item list — no re-unlock needed.
+pub const SYNC_ID: &str = "sync";
 /// Forgets the unlocked session and clears cached items from memory.
 pub const LOCK_ID: &str = "lock";
 /// Opens the settings window.
@@ -29,8 +32,9 @@ pub struct TrayHandles {
     _icon: TrayIcon,
     menu: Menu,
     show: MenuItem,
+    sync: MenuItem,
     lock: MenuItem,
-    lock_item_present: bool,
+    unlocked_items_present: bool,
 }
 
 impl TrayHandles {
@@ -41,26 +45,32 @@ impl TrayHandles {
         self.show.set_text(if unlocked { "Show" } else { "Unlock" });
     }
 
-    /// The Lock item only makes sense while there's something to lock.
-    /// `Menu`/`MenuItem` have no `set_visible` (checked against
-    /// `muda-0.19.3`) — hiding means structurally removing the item and
-    /// reinserting it later, right after Show, rather than disabling it.
-    pub fn set_lock_visible(&mut self, visible: bool) {
-        if visible == self.lock_item_present {
+    /// Sync and Lock only make sense while there's an unlocked session —
+    /// nothing to refresh or forget otherwise. `Menu`/`MenuItem` have no
+    /// `set_visible` (checked against `muda-0.19.3`) — hiding means
+    /// structurally removing the items and reinserting them later, right
+    /// after Show, rather than disabling them.
+    pub fn set_unlocked_items_visible(&mut self, visible: bool) {
+        if visible == self.unlocked_items_present {
             return;
         }
         if visible {
-            let _ = self.menu.insert(&self.lock, 1);
+            // Reinsert in display order: Sync directly under Show, Lock
+            // under Sync.
+            let _ = self.menu.insert(&self.sync, 1);
+            let _ = self.menu.insert(&self.lock, 2);
         } else {
+            let _ = self.menu.remove(&self.sync);
             let _ = self.menu.remove(&self.lock);
         }
-        self.lock_item_present = visible;
+        self.unlocked_items_present = visible;
     }
 }
 
 pub fn build() -> tray_icon::Result<TrayHandles> {
     let menu = Menu::new();
     let show = MenuItem::with_id(SHOW_ID, "Show", true, None);
+    let sync = MenuItem::with_id(SYNC_ID, "Sync", true, None);
     let lock = MenuItem::with_id(LOCK_ID, "Lock", true, None);
     let settings = MenuItem::with_id(SETTINGS_ID, "Settings…", true, None);
     let about = MenuItem::with_id(ABOUT_ID, "About…", true, None);
@@ -71,6 +81,7 @@ pub fn build() -> tray_icon::Result<TrayHandles> {
             .expect("appending a single item to a fresh menu cannot fail")
     };
     append(&show);
+    append(&sync);
     append(&lock);
     append(&PredefinedMenuItem::separator());
     append(&settings);
@@ -92,8 +103,9 @@ pub fn build() -> tray_icon::Result<TrayHandles> {
         _icon: icon,
         menu,
         show,
+        sync,
         lock,
-        lock_item_present: true,
+        unlocked_items_present: true,
     })
 }
 

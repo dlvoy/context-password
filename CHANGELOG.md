@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-30
+
+### Added
+
+- A tray Sync item, shown below Show once the vault is unlocked, that refreshes the cached item list against Bitwarden without requiring the master password again. The popup shows the same progress spinner as unlocking while it runs.
+
 ## [1.1.0] - 2026-08-30
 
 ### Added

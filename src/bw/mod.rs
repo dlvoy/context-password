@@ -54,6 +54,23 @@ fn worker_loop(
                 let _ = results_tx.send(Msg::Bw(result));
                 ctx.request_repaint();
             }
+            BwCmd::Sync => {
+                let result = match &session {
+                    None => BwResult::Failed {
+                        stage: "sync",
+                        message: "vault is locked".to_string(),
+                    },
+                    Some(key) => match exe::resolve(bw_path) {
+                        Err(message) => BwResult::Failed {
+                            stage: "resolve",
+                            message,
+                        },
+                        Ok(exe) => sync_then_list(&exe, uri_prefix, key),
+                    },
+                };
+                let _ = results_tx.send(Msg::Bw(result));
+                ctx.request_repaint();
+            }
             BwCmd::Lock => {
                 // Best-effort and silent either way: the worker's own
                 // session field is dropped (and zeroized) regardless of
@@ -167,14 +184,40 @@ fn unlock_sync_list(
     // The buffer held the cleartext session key — scrub it before it drops.
     key_bytes.fill(0);
 
-    if let Err(e) = cmd::sync(&exe, key.expose()) {
-        return BwResult::Failed {
-            stage: "sync",
-            message: e.to_string(),
-        };
+    // Stored as soon as it's known good, before sync/list/parse have a
+    // chance to fail — a failed sync or list must not throw away a
+    // perfectly valid session, or the tray's Sync item would have nothing
+    // left to reuse and the user would be forced back to re-entering their
+    // master password just to retry.
+    *session = Some(key);
+    let key = session.as_ref().expect("just assigned above");
+
+    sync_then_list(&exe, uri_prefix, key)
+}
+
+/// `bw sync` + `bw list items` + parse + filter — the shared tail of both a
+/// fresh unlock and the tray's Sync item (`BwCmd::Sync`), which reuses the
+/// session the worker already holds instead of unlocking again.
+fn sync_then_list(exe: &exe::BwExe, uri_prefix: &str, key: &Secret) -> BwResult {
+    // A non-zero exit is only logged, not treated as failure: an offline or
+    // otherwise failing `bw sync` shouldn't cost the user their (still
+    // perfectly usable) local list. A spawn error, by contrast, likely means
+    // `bw` itself is broken and the list call would fail too — reported as
+    // `Failed` rather than silently skipped.
+    match cmd::sync(exe, key.expose()) {
+        Ok(output) if !output.status.success() => {
+            eprintln!("bw: sync command returned a non-success exit code");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return BwResult::Failed {
+                stage: "sync",
+                message: e.to_string(),
+            };
+        }
     }
 
-    let list_output = match cmd::list_items(&exe, key.expose(), uri_prefix) {
+    let list_output = match cmd::list_items(exe, key.expose(), uri_prefix) {
         Ok(o) => o,
         Err(e) => {
             return BwResult::Failed {
@@ -204,11 +247,6 @@ fn unlock_sync_list(
     stdout_buf.fill(0);
 
     let (entries, dropped) = filter::build_entries(raw_items, uri_prefix);
-
-    // Kept for the process's lifetime; not read again until a later
-    // milestone adds a "refresh" command that can reuse it instead of
-    // unlocking again (each `bw unlock` invalidates the previous session).
-    *session = Some(key);
 
     BwResult::Items { entries, dropped }
 }

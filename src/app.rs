@@ -210,6 +210,11 @@ enum Content {
     /// blank or jumping straight to the prompt if it's opened (or already
     /// open) while a lock triggered from the tray is still in flight.
     Locking,
+    /// Waiting on the tray's Sync item: `bw sync` + `bw list items` against
+    /// the retained session, no re-unlock needed. Unlike `Locking`,
+    /// `cached_entries` is deliberately left untouched while this is in
+    /// flight — a failed sync must not destroy an otherwise working list.
+    Syncing,
     ShowingList {
         selected: usize,
         /// An inline reason a requested field couldn't be delivered (no
@@ -469,6 +474,8 @@ impl App {
             move |event: tray_icon::menu::MenuEvent| {
                 let cmd = if event.id() == tray::SHOW_ID {
                     TrayCmd::Show
+                } else if event.id() == tray::SYNC_ID {
+                    TrayCmd::Sync
                 } else if event.id() == tray::LOCK_ID {
                     TrayCmd::Lock
                 } else if event.id() == tray::SETTINGS_ID {
@@ -518,10 +525,10 @@ impl App {
 
         let mut tray = tray::build()?;
         // Locked at startup, so the tray should say "Unlock" and hide
-        // "Lock" from the very first frame, not just after the first state
-        // change.
+        // "Sync"/"Lock" from the very first frame, not just after the first
+        // state change.
         tray.set_show_label(false);
-        tray.set_lock_visible(false);
+        tray.set_unlocked_items_visible(false);
 
         let bw_cmd_tx = bw::spawn(
             cfg.bw_path.clone(),
@@ -571,6 +578,13 @@ impl App {
         }
         self.popup.target = target;
         self.popup.content = match (&self.cached_entries, &self.popup.content) {
+            // A sync submitted before the popup was last dismissed may
+            // still be in flight — resume showing its spinner regardless of
+            // whether a cache already exists (unlike `Unlocking`/`Locking`
+            // below, `cached_entries` is deliberately left populated during
+            // a sync), or this arm would lose to `(Some(_), _)` and show the
+            // stale list instead.
+            (_, Content::Syncing) => Content::Syncing,
             (Some(_), _) => Content::ShowingList {
                 selected: 0,
                 message: None,
@@ -593,7 +607,8 @@ impl App {
     fn set_vault_state(&mut self, state: VaultState) {
         self.vault_state = state;
         self.tray.set_show_label(state == VaultState::Unlocked);
-        self.tray.set_lock_visible(state == VaultState::Unlocked);
+        self.tray
+            .set_unlocked_items_visible(state == VaultState::Unlocked);
     }
 
     fn hide_popup(&mut self, ctx: &egui::Context) {
@@ -643,6 +658,29 @@ impl App {
         let _ = self.bw_cmd_tx.send(BwCmd::Lock);
     }
 
+    /// Re-runs `bw sync` + `bw list items` against the retained session,
+    /// without disturbing the popup — silent, like the tray's Lock item
+    /// isn't but this deliberately is (see the plan): a click on the tray
+    /// icon shouldn't yank focus. If the popup happens to already be open on
+    /// the list (or is closed), it switches to `Content::Syncing` so the
+    /// hotkey/Show reveals progress instead of a stale list; any other
+    /// screen (Settings, About, mid-prompt, fetching a TOTP) is left alone
+    /// — the refresh still happens in the background.
+    fn handle_sync(&mut self) {
+        if self.vault_state != VaultState::Unlocked
+            || matches!(self.popup.content, Content::Syncing)
+        {
+            return;
+        }
+        eprintln!("sync: refreshing cached items");
+        if self.popup.phase == ShowPhase::Hidden
+            || matches!(self.popup.content, Content::ShowingList { .. })
+        {
+            self.popup.content = Content::Syncing;
+        }
+        let _ = self.bw_cmd_tx.send(BwCmd::Sync);
+    }
+
     /// The only place `bw` worker results reach stderr — names and ORDs
     /// only, per `Entry::log_line`, never a password (and only at all when
     /// `debug_log` is on — plan §8's log review, M8) — and where they feed
@@ -650,6 +688,25 @@ impl App {
     fn handle_bw_result(&mut self, result: BwResult) {
         match result {
             BwResult::Items { entries, dropped } => {
+                // A Sync can be in flight when the tray's Lock item — still
+                // visible throughout a sync, since `vault_state` stays
+                // `Unlocked` — fires and clears `cached_entries` right out
+                // from under it. The worker processes commands strictly in
+                // send order (one `mpsc` queue, `BwCmd::Lock` queued after
+                // `BwCmd::Sync`), so `handle_lock`'s `Locking` state is still
+                // current when this stale result lands: dropping it here,
+                // rather than resurrecting `cached_entries` and stomping
+                // `vault_state` back to `Unlocked`, is what keeps "locked"
+                // meaning "nothing cached in memory." An in-flight *unlock*
+                // never hits this arm at `Locking` — the tray has no way to
+                // request a lock before an unlock's own `Items`/`Failed`
+                // result has already moved `vault_state` off `Locked`.
+                if self.vault_state == VaultState::Locking {
+                    if self.cfg.debug_log {
+                        eprintln!("bw: dropping stale sync result — a lock is in flight");
+                    }
+                    return;
+                }
                 if self.cfg.debug_log {
                     eprintln!(
                         "bw: unlocked, {} item(s) matched, {dropped} dropped",
@@ -661,19 +718,20 @@ impl App {
                 }
                 self.cached_entries = Some((entries, dropped));
                 self.set_vault_state(VaultState::Unlocked);
-                if matches!(self.popup.content, Content::Unlocking) {
+                if matches!(self.popup.content, Content::Unlocking | Content::Syncing) {
                     self.popup.content = Content::ShowingList {
                         selected: 0,
                         message: None,
                     };
                     if self.popup.phase == ShowPhase::Shown {
                         // The window is already placed/sized for the
-                        // smaller Prompting/Unlocking screen — re-enter
-                        // Placing so it picks up the list's own (dynamic)
-                        // width and height instead of keeping whatever size
-                        // it had before this switch. When the popup was
-                        // hidden instead, no fix-up is needed: `open_popup`
-                        // always re-places from scratch next time.
+                        // smaller Prompting/Unlocking/Syncing screen —
+                        // re-enter Placing so it picks up the list's own
+                        // (dynamic) width and height instead of keeping
+                        // whatever size it had before this switch. When the
+                        // popup was hidden instead, no fix-up is needed:
+                        // `open_popup` always re-places from scratch next
+                        // time.
                         self.popup.phase = ShowPhase::Placing;
                     }
                 }
@@ -687,6 +745,29 @@ impl App {
                             error: Some(format!("{stage}: {message}")),
                             revealed: false,
                         };
+                    }
+                    Content::Syncing => {
+                        // Unlike a failed unlock, there's an existing list
+                        // to fall back to (a sync never clears
+                        // `cached_entries`) — report the failure inline on
+                        // it rather than dropping all the way back to the
+                        // master-password prompt. The `None` case shouldn't
+                        // be reachable (Sync only ever runs while unlocked,
+                        // which implies a cache), but degrades to the
+                        // prompt rather than panicking if it somehow is.
+                        self.popup.content = match &self.cached_entries {
+                            Some(_) => Content::ShowingList {
+                                selected: 0,
+                                message: Some(format!("{stage}: {message}")),
+                            },
+                            None => PopupState::fresh_prompt(),
+                        };
+                        if self.popup.phase == ShowPhase::Shown {
+                            // Same re-measure as the success path above —
+                            // this can also switch a spinner-sized popup to
+                            // the list (or the prompt).
+                            self.popup.phase = ShowPhase::Placing;
+                        }
                     }
                     Content::FetchingOtp { selected } => {
                         let selected = *selected;
@@ -921,10 +1002,11 @@ impl App {
                     action = Action::Hide;
                 }
             }
-            Content::Unlocking | Content::Locking => {
+            Content::Unlocking | Content::Locking | Content::Syncing => {
                 // Dismiss-on-blur is suspended here (plan §1): an 8-15s
-                // cold unlock (or a lock) that vanishes on a stray click
-                // would be maddening. Escape still works — explicit intent.
+                // cold unlock (or a lock/sync) that vanishes on a stray
+                // click would be maddening. Escape still works — explicit
+                // intent.
                 if escape {
                     action = Action::Hide;
                 }
@@ -1253,6 +1335,7 @@ impl eframe::App for App {
                 Msg::Tray(TrayCmd::Show) | Msg::ShowPopup => {
                     self.open_popup(None);
                 }
+                Msg::Tray(TrayCmd::Sync) => self.handle_sync(),
                 Msg::Tray(TrayCmd::Lock) => self.handle_lock(),
                 Msg::Tray(TrayCmd::Settings) => self.open_settings(),
                 Msg::Tray(TrayCmd::About) => self.open_about(),
@@ -1389,6 +1472,7 @@ impl eframe::App for App {
             }
             Content::Unlocking => crate::ui::popup::busy(ui, "Unlocking vault…"),
             Content::Locking => crate::ui::popup::busy(ui, "Locking vault…"),
+            Content::Syncing => crate::ui::popup::busy(ui, "Syncing…"),
             Content::FetchingOtp { .. } => crate::ui::popup::busy(ui, "Fetching code…"),
             Content::ShowingList { selected, message } => {
                 let (all_entries, dropped) = self

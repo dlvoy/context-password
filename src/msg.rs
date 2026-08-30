@@ -21,6 +21,9 @@ pub enum Msg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCmd {
     Show,
+    /// Re-run `bw sync` + `bw list items` against the retained session and
+    /// replace the cached item list — no re-unlock needed.
+    Sync,
     /// Forget the unlocked session: clears the cached items (and their
     /// passwords) from memory, tells the worker to run `bw lock` and drop
     /// its own session key, and — if the popup is open — snaps it back to
@@ -34,6 +37,10 @@ pub enum TrayCmd {
 /// Commands the UI thread sends to the `bw` worker.
 pub enum BwCmd {
     Unlock(Secret),
+    /// Re-runs `bw sync` + `bw list items` using the session the worker
+    /// already holds, instead of unlocking again. Fails with `stage: "sync"`
+    /// if there's no session (the vault isn't actually unlocked).
+    Sync,
     /// Best-effort: runs `bw lock` and drops the worker's own session key
     /// regardless of whether that call succeeds — the user's intent is "we
     /// don't have a vault open anymore," not "only if the CLI agrees."
