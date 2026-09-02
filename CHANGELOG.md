@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-02
+
+### Added
+
+- Tag URIs accept an optional `?os=` filter (`app://context-password/1?os=win`, or a comma list
+  like `?os=win,mac`) to restrict an item to one or more systems, for vaults shared across
+  platforms. Omitting it shows an item everywhere, as before. An unrecognized value hides the item
+  and is counted in the existing hidden-item log; an item hidden for a different, well-formed OS
+  filter is not.
+
 ## [1.2.0] - 2026-08-30
 
 ### Added

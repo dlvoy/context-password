@@ -246,7 +246,8 @@ fn sync_then_list(exe: &exe::BwExe, uri_prefix: &str, key: &Secret) -> BwResult 
     // Held cleartext item passwords — scrub before it drops.
     stdout_buf.fill(0);
 
-    let (entries, dropped) = filter::build_entries(raw_items, uri_prefix);
+    let (entries, dropped) =
+        filter::build_entries(raw_items, uri_prefix, crate::platform::OS_TAG);
 
     BwResult::Items { entries, dropped }
 }

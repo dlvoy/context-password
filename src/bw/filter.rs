@@ -3,17 +3,141 @@
 //!
 //! `--search` is a fuzzy match across many fields (plan §6), so it is only
 //! a prefilter; the real filter — matching `login.uris[].uri` against the
-//! app's own prefix — happens here.
+//! app's own prefix, then its optional `?os=` list against this build's
+//! [`platform::OS_TAG`](crate::platform::OS_TAG) — happens here.
 
 use super::model::{Entry, RawItem};
+use crate::platform::OS_TAGS;
 use crate::secret::Secret;
 
-/// Returns `Some(ord)` if `item` carries a `<prefix>/<ORD>` uri (at any
-/// index in `login.uris`, regardless of `match`), or `None` if it doesn't
-/// belong to this app at all. The inner `ord` is `None` when the uri is
-/// present but its trailing segment is missing or unparseable.
-fn ord_of(item: &RawItem, prefix: &str) -> Option<Option<i64>> {
+/// What one `<prefix>/<ORD>[?os=...]` tag uri means for *this* build.
+enum Verdict {
+    /// Ours and meant for this build (no `os=` filter, or one that lists
+    /// this build's tag). Inner `None` = the ORD segment is missing or
+    /// unparseable — kept and sorted last, exactly as before `?os=`
+    /// existed.
+    Show(Option<i64>),
+    /// Ours, but its `os=` list names only other systems. Deliberate, so
+    /// the item is hidden *without* counting toward `dropped` — otherwise
+    /// a cross-platform vault would show a permanent "N item(s) hidden"
+    /// for entries that are working exactly as intended.
+    OtherOs,
+    /// Ours, but `os=` held no token this build recognises at all (e.g. a
+    /// typo like `?os=beos`, or an empty value). Hidden and counted, like
+    /// any other malformed item.
+    BadOs,
+}
+
+/// One resolved tag uri.
+struct Tag {
+    verdict: Verdict,
+    /// Set when the uri's `os=` value carried at least one token outside
+    /// [`OS_TAGS`] — even when another token in the same list still
+    /// matched (`?os=win,xx`) or the whole thing is [`Verdict::BadOs`].
+    /// Logged in `build_entries` so a typo is visible, independent of
+    /// whether it changed whether the item shows.
+    unknown_os: Option<String>,
+}
+
+fn verdict_priority(v: &Verdict) -> u8 {
+    match v {
+        Verdict::Show(_) => 2,
+        Verdict::BadOs => 1,
+        Verdict::OtherOs => 0,
+    }
+}
+
+/// Parses the bit after `?` on a single tag uri against this build's `os`
+/// token. `query` is empty when the uri had no `?` at all.
+fn classify(ord: Option<i64>, query: &str, os: &str) -> Tag {
+    if query.is_empty() {
+        return Tag {
+            verdict: Verdict::Show(ord),
+            unknown_os: None,
+        };
+    }
+
+    let mut saw_os_pair = false;
+    let mut recognized_any = false;
+    let mut matched = false;
+    let mut unknown: Vec<String> = Vec::new();
+    let mut raw_values: Vec<String> = Vec::new();
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        // No `=` (e.g. a bare `?os`) is treated as an empty value, not
+        // skipped — `?os` alone is exactly as malformed as `?os=`.
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if !key.trim().eq_ignore_ascii_case("os") {
+            // Unknown parameters are ignored, not errors.
+            continue;
+        }
+        saw_os_pair = true;
+        raw_values.push(value.trim().to_string());
+        for token in value.split(',') {
+            let token = token.trim().to_lowercase();
+            if token.is_empty() {
+                continue;
+            }
+            if OS_TAGS.contains(&token.as_str()) {
+                recognized_any = true;
+                if token == os {
+                    matched = true;
+                }
+            } else {
+                unknown.push(token);
+            }
+        }
+    }
+
+    if !saw_os_pair {
+        // A query string with no `os` pair at all (e.g. `?foo=bar`).
+        return Tag {
+            verdict: Verdict::Show(ord),
+            unknown_os: None,
+        };
+    }
+
+    let verdict = if !recognized_any {
+        Verdict::BadOs
+    } else if matched {
+        Verdict::Show(ord)
+    } else {
+        Verdict::OtherOs
+    };
+
+    let unknown_os = if !unknown.is_empty() {
+        Some(unknown.join(","))
+    } else if !recognized_any {
+        // Every `os=` pair was present but empty (`?os=` or `?os`) — still
+        // worth logging so the typo shows the (blank) value it had.
+        Some(raw_values.join(","))
+    } else {
+        None
+    };
+
+    Tag { verdict, unknown_os }
+}
+
+/// Returns the resolved tag for `item`, or `None` if none of its uris
+/// belong to this app at all (wrong prefix, or a mere substring collision
+/// like `app://context-password-other/1`).
+///
+/// An item can carry more than one tag uri — e.g.
+/// `app://context-password/1?os=win` alongside
+/// `app://context-password/5?os=mac`, giving it a different ORD per
+/// platform. When more than one tag uri is present, the first
+/// [`Verdict::Show`] wins; failing that, the first [`Verdict::BadOs`];
+/// failing that, [`Verdict::OtherOs`]. This is deliberate priority, not an
+/// arbitrary pick: a uri meant for this build always wins over one that
+/// isn't, and a malformed filter is surfaced over one that's merely for
+/// another OS.
+fn tag_of(item: &RawItem, prefix: &str, os: &str) -> Option<Tag> {
     let login = item.login.as_ref()?;
+    let mut best: Option<Tag> = None;
+
     for uri in &login.uris {
         let trimmed = uri.uri.trim();
         let Some(rest) = trimmed.strip_prefix(prefix) else {
@@ -25,21 +149,35 @@ fn ord_of(item: &RawItem, prefix: &str) -> Option<Option<i64>> {
         if !rest.is_empty() && !rest.starts_with('/') {
             continue;
         }
-        let ord_str = rest.trim_start_matches('/').trim();
-        return Some(if ord_str.is_empty() {
+        let rest = rest.trim_start_matches('/');
+        let (ord_part, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let ord_str = ord_part.trim();
+        let ord = if ord_str.is_empty() {
             None
         } else {
             ord_str.parse::<i64>().ok()
-        });
+        };
+
+        let tag = classify(ord, query, os);
+        best = match best {
+            Some(b) if verdict_priority(&b.verdict) >= verdict_priority(&tag.verdict) => Some(b),
+            _ => Some(tag),
+        };
     }
-    None
+
+    best
 }
 
 /// Filters and sorts raw `bw list items` output into the popup's entries.
-/// Returns the entries plus a count of items that were dropped (wrong item
-/// type, no password, or no matching `prefix` uri at all) — surfaced so a
-/// mistagged item doesn't silently vanish without a trace.
-pub fn build_entries(items: Vec<RawItem>, prefix: &str) -> (Vec<Entry>, usize) {
+/// `os` is this build's `?os=` token (`platform::OS_TAG` at the call site;
+/// threaded through as a parameter, not read directly, so tests can drive
+/// every platform from one build). Returns the entries plus a count of
+/// items that were dropped (wrong item type, no password, no matching
+/// `prefix` uri at all, or a malformed `os=` filter) — surfaced so a
+/// mistagged item doesn't silently vanish without a trace. Items filtered
+/// out by a well-formed `os=` for another platform are *not* counted here —
+/// see [`Verdict::OtherOs`].
+pub fn build_entries(items: Vec<RawItem>, prefix: &str, os: &str) -> (Vec<Entry>, usize) {
     let mut entries = Vec::new();
     let mut dropped = 0usize;
 
@@ -48,10 +186,32 @@ pub fn build_entries(items: Vec<RawItem>, prefix: &str) -> (Vec<Entry>, usize) {
             dropped += 1;
             continue;
         }
-        let Some(ord) = ord_of(&item, prefix) else {
+        let Some(tag) = tag_of(&item, prefix, os) else {
             dropped += 1;
             continue;
         };
+
+        let ord = match tag.verdict {
+            Verdict::Show(ord) => ord,
+            Verdict::BadOs => {
+                eprintln!(
+                    "bw: {:?} — app:// tag's os= filter has no token this build recognises \
+                     ({:?}); hiding it",
+                    item.name,
+                    tag.unknown_os.as_deref().unwrap_or("")
+                );
+                dropped += 1;
+                continue;
+            }
+            Verdict::OtherOs => continue,
+        };
+        if let Some(unknown) = &tag.unknown_os {
+            eprintln!(
+                "bw: {:?} — app:// tag's os= filter includes an unrecognised token: {unknown}",
+                item.name
+            );
+        }
+
         let Some(login) = item.login else {
             dropped += 1;
             continue;
@@ -92,6 +252,11 @@ mod tests {
     use crate::bw::model::{RawLogin, RawUri};
 
     const PREFIX: &str = "app://context-password";
+    /// The OS token these tests drive `build_entries` with by default —
+    /// arbitrary; the whole point of threading `os` through as a parameter
+    /// is that every token in `platform::OS_TAGS` is exercisable from a
+    /// single (Windows) test binary.
+    const OS: &str = "win";
 
     fn item(
         id: &str,
@@ -137,7 +302,7 @@ mod tests {
                 Some("pw2"),
             ),
         ];
-        let (entries, dropped) = build_entries(items, PREFIX);
+        let (entries, dropped) = build_entries(items, PREFIX, OS);
         assert_eq!(dropped, 0);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "a-item");
@@ -162,7 +327,7 @@ mod tests {
                 Some("pw"),
             ),
         ];
-        let (entries, _) = build_entries(items, PREFIX);
+        let (entries, _) = build_entries(items, PREFIX, OS);
         assert_eq!(entries[0].name, "apple");
         assert_eq!(entries[1].name, "Zebra");
     }
@@ -185,7 +350,7 @@ mod tests {
                 Some("pw"),
             ),
         ];
-        let (entries, _) = build_entries(items, PREFIX);
+        let (entries, _) = build_entries(items, PREFIX, OS);
         assert_eq!(entries[0].name, "has-ord"); // real ord (0) sorts before missing
         assert_eq!(entries[1].name, "no-ord");
     }
@@ -199,7 +364,7 @@ mod tests {
             vec![("app://context-password/abc", None)],
             Some("pw"),
         )];
-        let (entries, dropped) = build_entries(items, PREFIX);
+        let (entries, dropped) = build_entries(items, PREFIX, OS);
         assert_eq!(dropped, 0);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].ord, None);
@@ -217,7 +382,7 @@ mod tests {
             ],
             Some("pw"),
         )];
-        let (entries, dropped) = build_entries(items, PREFIX);
+        let (entries, dropped) = build_entries(items, PREFIX, OS);
         assert_eq!(dropped, 0);
         assert_eq!(entries[0].ord, Some(2));
     }
@@ -233,7 +398,21 @@ mod tests {
             vec![("app://context-password-other/1", None)],
             Some("pw"),
         )];
-        let (entries, dropped) = build_entries(items, PREFIX);
+        let (entries, dropped) = build_entries(items, PREFIX, OS);
+        assert_eq!(entries.len(), 0);
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn rejects_prefix_collision_even_with_a_query_string() {
+        let items = vec![item(
+            "1",
+            "impostor",
+            1,
+            vec![("app://context-password-other/1?os=win", None)],
+            Some("pw"),
+        )];
+        let (entries, dropped) = build_entries(items, PREFIX, OS);
         assert_eq!(entries.len(), 0);
         assert_eq!(dropped, 1);
     }
@@ -242,7 +421,7 @@ mod tests {
     fn drops_non_login_items() {
         let mut secure_note = item("1", "note", 2, vec![], None);
         secure_note.login = None;
-        let (entries, dropped) = build_entries(vec![secure_note], PREFIX);
+        let (entries, dropped) = build_entries(vec![secure_note], PREFIX, OS);
         assert_eq!(entries.len(), 0);
         assert_eq!(dropped, 1);
     }
@@ -256,7 +435,7 @@ mod tests {
             vec![("https://example.com", None)],
             Some("pw"),
         )];
-        let (entries, dropped) = build_entries(items, PREFIX);
+        let (entries, dropped) = build_entries(items, PREFIX, OS);
         assert_eq!(entries.len(), 0);
         assert_eq!(dropped, 1);
     }
@@ -271,7 +450,7 @@ mod tests {
             Some("pw"),
         );
         it.login = None;
-        let (entries, dropped) = build_entries(vec![it], PREFIX);
+        let (entries, dropped) = build_entries(vec![it], PREFIX, OS);
         assert_eq!(entries.len(), 0);
         assert_eq!(dropped, 1);
     }
@@ -285,7 +464,7 @@ mod tests {
             vec![("app://context-password/1", None)],
             Some(""),
         )];
-        let (entries, dropped) = build_entries(items, PREFIX);
+        let (entries, dropped) = build_entries(items, PREFIX, OS);
         assert_eq!(entries.len(), 0);
         assert_eq!(dropped, 1);
     }
@@ -332,11 +511,21 @@ mod tests {
               ],
               "username": "admin", "password": "REDACTED", "totp": "REDACTED"
             }
+          },
+          {
+            "type": 1, "id": "44444444-4444-4444-4444-444444444444",
+            "name": "mac-only-vpn",
+            "login": {
+              "uris": [
+                {"uri": "app://context-password/4?os=mac"}
+              ],
+              "username": "admin", "password": "REDACTED"
+            }
           }
         ]"#;
         let items: Vec<RawItem> = serde_json::from_str(json).unwrap();
-        let (entries, dropped) = build_entries(items, PREFIX);
-        assert_eq!(dropped, 0);
+        let (entries, dropped) = build_entries(items, PREFIX, OS);
+        assert_eq!(dropped, 0, "the os=mac item is filtered out, not dropped");
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].name, "nas - admin"); // ord 1
         assert_eq!(entries[1].name, "example@home-server"); // ord 2
@@ -355,7 +544,7 @@ mod tests {
             Some("pw"),
         );
         with_empty.login.as_mut().unwrap().totp = Some(String::new());
-        let (entries, _) = build_entries(vec![with_empty], PREFIX);
+        let (entries, _) = build_entries(vec![with_empty], PREFIX, OS);
         assert!(!entries[0].has_totp);
     }
 
@@ -369,7 +558,207 @@ mod tests {
             Some("pw"),
         );
         with_totp.login.as_mut().unwrap().totp = Some("SEED".to_string());
-        let (entries, _) = build_entries(vec![with_totp], PREFIX);
+        let (entries, _) = build_entries(vec![with_totp], PREFIX, OS);
         assert!(entries[0].has_totp);
+    }
+
+    // --- ?os= filtering ---------------------------------------------------
+
+    #[test]
+    fn ord_survives_a_query_string() {
+        let items = vec![item(
+            "1",
+            "tagged",
+            1,
+            vec![("app://context-password/1?os=win", None)],
+            Some("pw"),
+        )];
+        let (entries, dropped) = build_entries(items, PREFIX, OS);
+        assert_eq!(dropped, 0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ord, Some(1));
+    }
+
+    #[test]
+    fn shows_on_matching_os() {
+        let items = vec![item(
+            "1",
+            "win-only",
+            1,
+            vec![("app://context-password/1?os=win", None)],
+            Some("pw"),
+        )];
+        let (entries, dropped) = build_entries(items, PREFIX, "win");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn hides_on_non_matching_os_without_counting_as_dropped() {
+        let items = vec![item(
+            "1",
+            "mac-only",
+            1,
+            vec![("app://context-password/1?os=mac", None)],
+            Some("pw"),
+        )];
+        let (entries, dropped) = build_entries(items, PREFIX, "win");
+        assert_eq!(entries.len(), 0);
+        assert_eq!(dropped, 0, "filtered for another OS is not a drop");
+    }
+
+    #[test]
+    fn comma_list_matches_any_listed_os() {
+        let uri = "app://context-password/1?os=win,mac";
+        let win = build_entries(
+            vec![item("1", "cross", 1, vec![(uri, None)], Some("pw"))],
+            PREFIX,
+            "win",
+        );
+        assert_eq!(win.0.len(), 1);
+        let mac = build_entries(
+            vec![item("1", "cross", 1, vec![(uri, None)], Some("pw"))],
+            PREFIX,
+            "mac",
+        );
+        assert_eq!(mac.0.len(), 1);
+        let linux = build_entries(
+            vec![item("1", "cross", 1, vec![(uri, None)], Some("pw"))],
+            PREFIX,
+            "linux",
+        );
+        assert_eq!(linux.0.len(), 0);
+        assert_eq!(linux.1, 0);
+    }
+
+    #[test]
+    fn repeated_os_param_unions_like_a_comma_list() {
+        let uri = "app://context-password/1?os=win&os=mac";
+        let win = build_entries(
+            vec![item("1", "cross", 1, vec![(uri, None)], Some("pw"))],
+            PREFIX,
+            "win",
+        );
+        assert_eq!(win.0.len(), 1);
+        let mac = build_entries(
+            vec![item("1", "cross", 1, vec![(uri, None)], Some("pw"))],
+            PREFIX,
+            "mac",
+        );
+        assert_eq!(mac.0.len(), 1);
+    }
+
+    #[test]
+    fn os_matching_is_case_and_whitespace_insensitive() {
+        for uri in [
+            "app://context-password/1?os=Win",
+            "app://context-password/1?os=win, mac",
+            "app://context-password/1?OS=win",
+        ] {
+            let items = vec![item("1", "cross", 1, vec![(uri, None)], Some("pw"))];
+            let (entries, dropped) = build_entries(items, PREFIX, "win");
+            assert_eq!(entries.len(), 1, "uri {uri:?} should match win");
+            assert_eq!(dropped, 0);
+        }
+    }
+
+    #[test]
+    fn every_supported_os_token_round_trips() {
+        for &os in OS_TAGS.iter() {
+            let uri = format!("app://context-password/1?os={os}");
+            let items = vec![item("1", "cross", 1, vec![(&uri, None)], Some("pw"))];
+            let (entries, dropped) = build_entries(items, PREFIX, os);
+            assert_eq!(entries.len(), 1, "{os} should match its own tag");
+            assert_eq!(dropped, 0);
+        }
+        // ?os=ios hides on win without inflating `dropped`.
+        let items = vec![item(
+            "1",
+            "ios-only",
+            1,
+            vec![("app://context-password/1?os=ios", None)],
+            Some("pw"),
+        )];
+        let (entries, dropped) = build_entries(items, PREFIX, "win");
+        assert_eq!(entries.len(), 0);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn unrecognised_os_value_hides_and_counts_as_dropped() {
+        for uri in [
+            "app://context-password/1?os=beos",
+            "app://context-password/1?os=",
+            "app://context-password/1?os",
+        ] {
+            let items = vec![item("1", "typo", 1, vec![(uri, None)], Some("pw"))];
+            let (entries, dropped) = build_entries(items, PREFIX, OS);
+            assert_eq!(entries.len(), 0, "uri {uri:?} should be hidden");
+            assert_eq!(dropped, 1, "uri {uri:?} should count as dropped");
+        }
+    }
+
+    #[test]
+    fn partially_bad_os_value_still_shows_on_the_recognised_token() {
+        let items = vec![item(
+            "1",
+            "partial",
+            1,
+            vec![("app://context-password/1?os=win,xx", None)],
+            Some("pw"),
+        )];
+        let (entries, dropped) = build_entries(items, PREFIX, "win");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn unknown_query_param_is_ignored() {
+        let items = vec![item(
+            "1",
+            "unrelated-param",
+            1,
+            vec![("app://context-password/1?foo=bar", None)],
+            Some("pw"),
+        )];
+        let (entries, dropped) = build_entries(items, PREFIX, OS);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ord, Some(1));
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn missing_ord_with_an_os_filter_is_still_shown_sorted_last() {
+        let items = vec![item(
+            "1",
+            "no-ord-filtered",
+            1,
+            vec![("app://context-password/?os=win", None)],
+            Some("pw"),
+        )];
+        let (entries, dropped) = build_entries(items, PREFIX, "win");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ord, None);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn an_item_can_have_a_different_ord_per_os() {
+        let uris = vec![
+            ("app://context-password/1?os=win", None),
+            ("app://context-password/5?os=mac", None),
+        ];
+        let (win_entries, _) = build_entries(
+            vec![item("1", "per-os", 1, uris.clone(), Some("pw"))],
+            PREFIX,
+            "win",
+        );
+        assert_eq!(win_entries[0].ord, Some(1));
+        let (mac_entries, _) = build_entries(
+            vec![item("1", "per-os", 1, uris, Some("pw"))],
+            PREFIX,
+            "mac",
+        );
+        assert_eq!(mac_entries[0].ord, Some(5));
     }
 }

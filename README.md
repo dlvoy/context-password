@@ -69,6 +69,28 @@ shows up first in the popup, labeled "Example Server". A missing or unparseable 
 `app://context-password/` with nothing after the slash) still shows the item — just sorted after
 every properly numbered one, so a typo is visible rather than silently hiding the item.
 
+### Restricting an item to one or more systems
+
+If you share a vault across a Windows machine and another platform, append `?os=` to limit where an
+item shows up:
+
+```
+app://context-password/2?os=win
+app://context-password/3?os=win,mac
+```
+
+Supported tokens: `win`, `mac`, `linux`, `android`, `ios` — comma-separated for more than one, and
+matching is case-insensitive. Leaving `?os=` off (as in the examples above) shows the item on every
+system, unchanged from before. An item can even carry more than one tag uri to get a different
+position per platform, e.g. `app://context-password/1?os=win` alongside
+`app://context-password/5?os=mac`.
+
+An unrecognized value (`?os=beos`, or `?os=` with nothing after the `=`) hides the item and counts
+it in the "N item(s) hidden — see log" line, the same as any other malformed tag — so a typo is
+visible instead of silently doing nothing. An item correctly filtered out for a *different* system
+(e.g. `?os=mac` on this Windows build) is not counted there at all; it's working as intended, not an
+error.
+
 ## Using it
 
 - **Hotkey** (default `Ctrl+Alt+V`, configurable in Settings): opens the popup at your cursor.
