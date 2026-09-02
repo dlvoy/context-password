@@ -531,11 +531,12 @@ impl App {
         tray.set_show_label(false);
         tray.set_unlocked_items_visible(false);
 
+        let bw_waker_ctx = cc.egui_ctx.clone();
         let bw_cmd_tx = bw::spawn(
             cfg.bw_path.clone(),
             cfg.uri_prefix.clone(),
             tx.clone(),
-            cc.egui_ctx.clone(),
+            std::sync::Arc::new(move || bw_waker_ctx.request_repaint()),
         );
 
         Ok(Self {

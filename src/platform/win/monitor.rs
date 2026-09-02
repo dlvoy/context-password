@@ -17,6 +17,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
+use crate::platform::place::{self, Rect};
+
 /// The DPI Windows treats as "100%" — every scale factor is relative to it.
 const BASE_DPI: f32 = 96.0;
 /// Default offset from the cursor, in 96-DPI-equivalent points, before any
@@ -48,15 +50,23 @@ pub fn placement_for(cursor: Option<(i32, i32)>, w_pt: i32, h_pt: i32) -> Placem
     let h = (h_pt as f32 * scale).round() as i32;
     let offset = (CURSOR_OFFSET_PT as f32 * scale).round() as i32;
 
-    let (x, y) = place_within(work, cursor, w, h, offset);
+    let work_rect = Rect {
+        left: work.left,
+        top: work.top,
+        right: work.right,
+        bottom: work.bottom,
+    };
+    let (x, y) = place::place_within(work_rect, cursor, w, h, offset);
     Placement { x, y, w, h }
 }
 
 /// The live Win32 half: which monitor is under `cursor` (or the primary
 /// monitor if `None`), its work area, and its DPI scale factor relative to
 /// 96 DPI. Not unit-tested — it's a thin wrapper over three system calls
-/// with an obvious fallback if any of them fail; `place_within` below is
-/// where the actual placement logic lives and is tested.
+/// with an obvious fallback if any of them fail; `platform::place::place_within`
+/// is where the actual placement logic lives and is tested (shared with
+/// macOS's `monitor_metrics`, which does the equivalent bottom-left-to-
+/// top-left Y flip before calling into the same function).
 fn monitor_metrics(cursor: Option<(i32, i32)>) -> (RECT, f32) {
     let (monitor_point, monitor_flag) = match cursor {
         Some((x, y)) => (POINT { x, y }, MONITOR_DEFAULTTONEAREST),
@@ -96,121 +106,3 @@ fn monitor_metrics(cursor: Option<(i32, i32)>) -> (RECT, f32) {
     }
 }
 
-/// The flip-then-clamp math, in physical pixels, already-scaled sizes, and
-/// with no Win32 calls — pure enough to unit test directly.
-fn place_within(
-    work: RECT,
-    cursor: Option<(i32, i32)>,
-    w: i32,
-    h: i32,
-    offset: i32,
-) -> (i32, i32) {
-    let (x, y) = match cursor {
-        Some((cursor_x, cursor_y)) => {
-            let mut x = cursor_x + offset;
-            let mut y = cursor_y + offset;
-            if x + w > work.right {
-                x = cursor_x - w - offset; // flip to the left of the cursor
-            }
-            if y + h > work.bottom {
-                y = cursor_y - h - offset; // flip above the cursor
-            }
-            (x, y)
-        }
-        None => (
-            work.left + (work.right - work.left - w) / 2,
-            work.top + (work.bottom - work.top - h) / 2,
-        ),
-    };
-
-    // Last resort: even after flipping, a monitor smaller than the popup
-    // (or a cursor pinned right in a corner) could still leave it hanging
-    // off an edge — clamp fully inside the work area.
-    let x = x.clamp(work.left, (work.right - w).max(work.left));
-    let y = y.clamp(work.top, (work.bottom - h).max(work.top));
-    (x, y)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A 1920x1080 monitor at (0,0) with a 40px taskbar docked at the
-    /// bottom — `rcWork` excludes it, which is what `place_within` always
-    /// receives.
-    const WORK: RECT = RECT {
-        left: 0,
-        top: 0,
-        right: 1920,
-        bottom: 1040,
-    };
-    const W: i32 = 340;
-    const H: i32 = 220;
-    const OFFSET: i32 = 8;
-
-    #[test]
-    fn offsets_down_right_when_it_fits() {
-        let (x, y) = place_within(WORK, Some((500, 500)), W, H, OFFSET);
-        assert_eq!((x, y), (508, 508));
-    }
-
-    #[test]
-    fn flips_left_near_the_right_edge() {
-        // cursor 100px from the right edge — offset+width would overrun it.
-        let cursor = (WORK.right - 100, 500);
-        let (x, _y) = place_within(WORK, Some(cursor), W, H, OFFSET);
-        assert_eq!(x, cursor.0 - W - OFFSET, "should flip to the left of the cursor");
-        assert!(x + W <= WORK.right, "must not run past the right edge");
-    }
-
-    #[test]
-    fn flips_up_near_the_bottom_edge() {
-        // cursor 100px from the bottom of the *work area* (above the
-        // taskbar) — offset+height would overrun it.
-        let cursor = (500, WORK.bottom - 100);
-        let (_x, y) = place_within(WORK, Some(cursor), W, H, OFFSET);
-        assert_eq!(y, cursor.1 - H - OFFSET, "should flip above the cursor");
-        assert!(y + H <= WORK.bottom, "must not run under the taskbar");
-    }
-
-    #[test]
-    fn flips_both_axes_in_the_bottom_right_corner() {
-        let cursor = (WORK.right - 5, WORK.bottom - 5);
-        let (x, y) = place_within(WORK, Some(cursor), W, H, OFFSET);
-        assert!(x + W <= WORK.right);
-        assert!(y + H <= WORK.bottom);
-        assert!(x >= WORK.left);
-        assert!(y >= WORK.top);
-    }
-
-    #[test]
-    fn clamps_when_pinned_exactly_in_the_top_left_corner() {
-        // Flipping left/up from (0,0) would go negative; the clamp must
-        // catch what the flip alone can't.
-        let (x, y) = place_within(WORK, Some((0, 0)), W, H, OFFSET);
-        assert!(x >= WORK.left);
-        assert!(y >= WORK.top);
-    }
-
-    #[test]
-    fn clamps_without_panicking_when_popup_is_bigger_than_the_monitor() {
-        let tiny_work = RECT {
-            left: 0,
-            top: 0,
-            right: 200,
-            bottom: 150,
-        };
-        let (x, y) = place_within(tiny_work, Some((100, 100)), W, H, OFFSET);
-        // Can't satisfy "fully on screen" here — just must not panic, and
-        // must not drift left/above the monitor entirely.
-        assert!(x >= tiny_work.left);
-        assert!(y >= tiny_work.top);
-    }
-
-    #[test]
-    fn centers_on_the_work_area_when_there_is_no_cursor() {
-        let (x, y) = place_within(WORK, None, W, H, OFFSET);
-        assert_eq!(x, (WORK.right - W) / 2);
-        assert_eq!(y, (WORK.bottom - H) / 2);
-    }
-}

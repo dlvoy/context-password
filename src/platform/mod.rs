@@ -10,6 +10,16 @@ mod win;
 #[cfg(windows)]
 pub use win::*;
 
+#[cfg(target_os = "macos")]
+mod mac;
+#[cfg(target_os = "macos")]
+pub use mac::*;
+
+/// The `place_within` flip-then-clamp popup-placement math, shared by every
+/// OS's `monitor` module — see the module doc there for why it lives here
+/// rather than under `win`/`mac`.
+pub mod place;
+
 /// This build's token for the `?os=` filter on tag uris (`bw::filter`) —
 /// the first runtime OS identifier in the codebase. Everything else here is
 /// compile-time `#[cfg]`; this is a `const` rather than

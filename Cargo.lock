@@ -338,6 +338,7 @@ dependencies = [
  "egui",
  "embed-resource",
  "global-hotkey",
+ "libc",
  "log",
  "raw-window-handle",
  "serde",

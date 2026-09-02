@@ -15,24 +15,29 @@ pub mod filter;
 pub mod model;
 
 use std::sync::mpsc::{Receiver, Sender};
-
-use eframe::egui;
+use std::sync::Arc;
 
 use crate::msg::{BwCmd, BwResult, Msg};
 use crate::secret::Secret;
 
+/// Wakes whatever event loop owns the UI thread after a result has been
+/// pushed onto `results_tx` — `ctx.request_repaint()` on Windows/eframe, a
+/// run-loop signal on macOS/AppKit. Every other event source in this app
+/// (tray, hotkey, the delayed-unlock timer) follows the same "send, then
+/// wake" pattern; this is what lets `bw::spawn` stay UI-toolkit-agnostic.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
 /// Spawns the worker thread and returns a channel to send it commands.
 /// Results are pushed back through `results_tx` — the app's shared `Msg`
-/// channel — followed by `ctx.request_repaint()`, the same wake pattern
-/// every other event source in this app uses.
+/// channel — followed by a call to `wake`.
 pub fn spawn(
     bw_path: String,
     uri_prefix: String,
     results_tx: Sender<Msg>,
-    ctx: egui::Context,
+    wake: Waker,
 ) -> Sender<BwCmd> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BwCmd>();
-    std::thread::spawn(move || worker_loop(&bw_path, &uri_prefix, &cmd_rx, &results_tx, &ctx));
+    std::thread::spawn(move || worker_loop(&bw_path, &uri_prefix, &cmd_rx, &results_tx, &wake));
     cmd_tx
 }
 
@@ -41,7 +46,7 @@ fn worker_loop(
     uri_prefix: &str,
     cmd_rx: &Receiver<BwCmd>,
     results_tx: &Sender<Msg>,
-    ctx: &egui::Context,
+    wake: &Waker,
 ) {
     // Blocks at zero CPU between commands; never crosses back to the UI.
     let mut session: Option<Secret> = None;
@@ -52,7 +57,7 @@ fn worker_loop(
                 let result =
                     unlock_sync_list(bw_path, uri_prefix, &master_password, &mut session);
                 let _ = results_tx.send(Msg::Bw(result));
-                ctx.request_repaint();
+                wake();
             }
             BwCmd::Sync => {
                 let result = match &session {
@@ -69,7 +74,7 @@ fn worker_loop(
                     },
                 };
                 let _ = results_tx.send(Msg::Bw(result));
-                ctx.request_repaint();
+                wake();
             }
             BwCmd::Lock => {
                 // Best-effort and silent either way: the worker's own
@@ -89,12 +94,12 @@ fn worker_loop(
                 }
                 session = None;
                 let _ = results_tx.send(Msg::Bw(BwResult::Locked));
-                ctx.request_repaint();
+                wake();
             }
             BwCmd::GetTotp(item_id) => {
                 let result = get_totp(bw_path, &item_id, &session);
                 let _ = results_tx.send(Msg::Bw(result));
-                ctx.request_repaint();
+                wake();
             }
         }
     }

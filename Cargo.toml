@@ -9,8 +9,6 @@ repository = "https://github.com/dlvoy/context-password"
 publish = false
 
 [dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
-egui = { version = "0.36", default-features = false }
 global-hotkey = "0.8"
 tray-icon = "0.24"
 serde = { version = "1", features = ["derive"] }
@@ -18,7 +16,17 @@ serde_json = "1"
 toml = "1"
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
 log = "0.4"
+
+# egui/eframe are the Windows front-end only — macOS uses native AppKit
+# (src/mac_ui/, Phase 5 of the port plan). Keeping them target-scoped is what
+# lets `cargo build`/`cargo test` run on macOS at all.
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+egui = { version = "0.36", default-features = false }
 raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.61"

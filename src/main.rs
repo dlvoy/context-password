@@ -2,6 +2,7 @@
 // builds keep the console so `eprintln!` output is visible while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(windows)]
 mod app;
 mod bw;
 mod config;
@@ -10,26 +11,22 @@ mod msg;
 mod platform;
 mod secret;
 mod tray;
+#[cfg(windows)]
 mod ui;
-
-use eframe::egui;
 
 use config::Config;
 use platform::singleton::SingleInstance;
 
+#[cfg(windows)]
 fn main() {
+    use eframe::egui;
+
     let Some(_instance_guard) = SingleInstance::acquire() else {
         eprintln!("context-password is already running; exiting");
         return;
     };
 
-    let cfg = match Config::load() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("failed to load config, using defaults: {e}");
-            Config::default()
-        }
-    };
+    let cfg = load_config();
     eprintln!("context-password starting (hotkey={})", cfg.hotkey);
 
     // Must happen on this thread, before `eframe::run_native` hands it to
@@ -64,5 +61,29 @@ fn main() {
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, hotkey, cfg)?))),
     ) {
         eprintln!("eframe exited with an error: {e}");
+    }
+}
+
+/// macOS entry point. Phase 1 stub: proves the singleton guard, config
+/// loading, and the `platform::mac` module shape all compile and run — the
+/// real hotkey/tray/popup wiring lands in `src/mac_ui/` (port plan Phase 5).
+#[cfg(target_os = "macos")]
+fn main() {
+    let Some(_instance_guard) = SingleInstance::acquire() else {
+        eprintln!("context-password is already running; exiting");
+        return;
+    };
+
+    let cfg = load_config();
+    eprintln!("context-password starting (hotkey={}) — macOS stub, no UI yet", cfg.hotkey);
+}
+
+fn load_config() -> Config {
+    match Config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("failed to load config, using defaults: {e}");
+            Config::default()
+        }
     }
 }

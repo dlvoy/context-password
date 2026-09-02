@@ -10,10 +10,13 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub enum BwExe {
-    /// A real `bw.exe` — spawn directly.
+    /// A real `bw.exe`/`bw` — spawn directly.
     Direct(PathBuf),
     /// A `.cmd`/`.bat` shim — must be spawned as an argument to `cmd.exe`,
-    /// not as the program itself (see `bw::cmd`).
+    /// not as the program itself (see `bw::cmd`). Windows-only concept:
+    /// npm's shim for a CLI it installs is a batch file there, but a plain
+    /// executable everywhere else.
+    #[cfg(windows)]
     ViaCmd(PathBuf),
 }
 
@@ -23,7 +26,9 @@ impl BwExe {
     #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         match self {
-            BwExe::Direct(p) | BwExe::ViaCmd(p) => p,
+            BwExe::Direct(p) => p,
+            #[cfg(windows)]
+            BwExe::ViaCmd(p) => p,
         }
     }
 }
@@ -53,6 +58,7 @@ pub fn resolve(bw_path: &str) -> Result<BwExe, String> {
     )
 }
 
+#[cfg(windows)]
 fn classify(path: &Path) -> Option<BwExe> {
     if !path.is_file() {
         return None;
@@ -66,9 +72,24 @@ fn classify(path: &Path) -> Option<BwExe> {
     }
 }
 
+/// No shim concept on macOS — a plain executable, extension or not (`bw`
+/// itself has none; a hand-rolled wrapper script might). `is_file` plus an
+/// `X_OK` check is the whole test.
+#[cfg(target_os = "macos")]
+fn classify(path: &Path) -> Option<BwExe> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = path.metadata().ok()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return None;
+    }
+    Some(BwExe::Direct(path.to_path_buf()))
+}
+
 /// Walks `PATH`, trying each directory with every extension in `PATHEXT` —
 /// the same resolution order `cmd.exe` itself uses, since `Command::new`
 /// only tries `.exe` on Windows.
+#[cfg(windows)]
 fn search_path(name: &str) -> Option<BwExe> {
     let path_var = std::env::var_os("PATH")?;
     let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
@@ -85,6 +106,20 @@ fn search_path(name: &str) -> Option<BwExe> {
     None
 }
 
+/// Walks `PATH` (`:`-separated, no extensions to try) — the same as any
+/// other Unix shell would resolve `bw`.
+#[cfg(target_os = "macos")]
+fn search_path(name: &str) -> Option<BwExe> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        if let Some(found) = classify(&dir.join(name)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
 fn known_install_locations() -> Vec<PathBuf> {
     let mut locations = Vec::new();
     if let Some(appdata) = std::env::var_os("APPDATA") {
@@ -96,6 +131,24 @@ fn known_install_locations() -> Vec<PathBuf> {
                 .join("Bitwarden CLI")
                 .join("bw.exe"),
         );
+    }
+    locations
+}
+
+/// A GUI-launched `.app` inherits only `/usr/bin:/bin:/usr/sbin:/sbin` —
+/// none of these — so this fallback list matters far more than the Windows
+/// one. Order matters: prefer Homebrew's own prefix for the running
+/// architecture, then the Intel-Homebrew/manual-install location this
+/// machine's `bw` actually lives at, then npm's global prefix.
+#[cfg(target_os = "macos")]
+fn known_install_locations() -> Vec<PathBuf> {
+    let mut locations = vec![
+        PathBuf::from("/opt/homebrew/bin/bw"),
+        PathBuf::from("/usr/local/bin/bw"),
+        PathBuf::from("/usr/local/opt/bitwarden-cli/bin/bw"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        locations.push(PathBuf::from(&home).join(".npm-global/bin/bw"));
     }
     locations
 }
