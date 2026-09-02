@@ -6,6 +6,8 @@
 mod app;
 mod bw;
 mod config;
+#[cfg(windows)]
+mod controller;
 mod hotkey;
 mod msg;
 mod platform;
