@@ -3,8 +3,8 @@
 //! so there is exactly one place that decides what an event means.
 
 use crate::bw::model::Entry;
+use crate::platform::focus::Target;
 use crate::secret::Secret;
-use crate::win::focus::Target;
 
 // No `derive(Debug)` here: `Bw(BwResult)` carries item data and, per plan
 // §8, nothing in that path gets a Debug impl that could print it.
@@ -13,7 +13,7 @@ pub enum Msg {
     Hotkey(Target),
     /// Open the popup with no cursor/target context — used by the tray's
     /// Show item and by the delayed-unlock timer. Falls back to centering
-    /// on the primary monitor (see `win::monitor::placement_for`).
+    /// on the primary monitor (see `platform::monitor::placement_for`).
     ShowPopup,
     Bw(BwResult),
 }

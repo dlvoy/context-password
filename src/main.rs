@@ -7,15 +7,15 @@ mod bw;
 mod config;
 mod hotkey;
 mod msg;
+mod platform;
 mod secret;
 mod tray;
 mod ui;
-mod win;
 
 use eframe::egui;
 
 use config::Config;
-use win::singleton::SingleInstance;
+use platform::singleton::SingleInstance;
 
 fn main() {
     let Some(_instance_guard) = SingleInstance::acquire() else {

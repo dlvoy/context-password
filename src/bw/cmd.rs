@@ -10,16 +10,20 @@
 //! outside).
 
 use std::io;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Output, Stdio};
 
 use super::exe::BwExe;
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn base(exe: &BwExe) -> Command {
     let mut cmd = match exe {
         BwExe::Direct(path) => Command::new(path),
+        // `ViaCmd` only exists on Windows — see `bw::exe::BwExe`.
+        #[cfg(windows)]
         BwExe::ViaCmd(path) => {
             // The .cmd is passed as an *argument* to cmd.exe rather than as
             // the program — this sidesteps Rust's post-CVE-2024-24576
@@ -36,9 +40,12 @@ fn base(exe: &BwExe) -> Command {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
         .env("NO_COLOR", "1")
         .env_remove("BW_SESSION");
+    // No console flash on Windows — irrelevant on macOS, which has no
+    // console window to flash in the first place.
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
 }
 

@@ -79,7 +79,9 @@ automatically, reading the version straight from `Cargo.toml`.
 - `src/bw/` — everything that talks to the `bw` CLI: the worker thread, executable resolution,
   command building, and client-side filtering of vault items.
 - `src/ui/` — pure rendering functions for each popup screen (prompt, item list, Settings, About).
-- `src/win/` — Win32 specifics: focus capture/restore, window placement, autostart, typing.
+- `src/platform/win/` — Win32 specifics: focus capture/restore, window placement, autostart,
+  typing. A future macOS port lands alongside it as `src/platform/mac/`, both exposing the same
+  module API via `src/platform/mod.rs`'s `#[cfg]` switch.
 - `src/hotkey.rs`, `src/config.rs`, `src/secret.rs`, `src/msg.rs`, `src/tray.rs` — the global
   hotkey registration, on-disk config, the password-holding type, the inter-thread message enum,
   and the tray icon/menu.

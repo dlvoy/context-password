@@ -49,10 +49,18 @@ pub struct Config {
     pub debug_log: bool,
 }
 
+/// The out-of-the-box hotkey spec, in `global_hotkey::hotkey::HotKey::from_str`
+/// form. macOS gets `Cmd` instead of `Ctrl` — the platform-conventional
+/// modifier for a global shortcut, and one Windows doesn't have.
+#[cfg(windows)]
+const DEFAULT_HOTKEY: &str = "Ctrl+Alt+KeyV";
+#[cfg(target_os = "macos")]
+const DEFAULT_HOTKEY: &str = "Cmd+Shift+KeyV";
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            hotkey: "Ctrl+Alt+KeyV".to_string(),
+            hotkey: DEFAULT_HOTKEY.to_string(),
             unlock_mode: UnlockMode::Delayed,
             unlock_delay_secs: 20,
             autostart: false,
@@ -75,10 +83,22 @@ impl Config {
         self.max_visible_items.clamp(MIN_VISIBLE_ITEMS, MAX_VISIBLE_ITEMS) as usize
     }
 
+    #[cfg(windows)]
     pub fn config_path() -> io::Result<PathBuf> {
         let appdata = std::env::var_os("APPDATA")
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "%APPDATA% is not set"))?;
         Ok(PathBuf::from(appdata)
+            .join("context-password")
+            .join("config.toml"))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn config_path() -> io::Result<PathBuf> {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "$HOME is not set"))?;
+        Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
             .join("context-password")
             .join("config.toml"))
     }

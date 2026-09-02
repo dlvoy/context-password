@@ -19,23 +19,55 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IsIconic, IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
 
+use super::super::BlockReason;
 use super::integrity;
 
 /// The window that had focus immediately before the popup was summoned,
 /// plus enough context to restore it later and to place the popup now.
-/// `hwnd`/`focus_child` are stored as `isize` rather than `HWND` so `Target`
-/// is `Send` — it travels through the app's `mpsc` channel.
+/// Fields are private — callers outside this module go through the
+/// platform-agnostic accessors below (`cursor`, `blocked`, `still_valid`,
+/// `is_foreground`) rather than reaching into Win32 specifics, so a future
+/// macOS `Target` (built from a pid/`AXUIElement` instead of an HWND) can
+/// expose the same surface. `hwnd`/`focus_child` are stored as `isize`
+/// rather than `HWND` so `Target` is `Send` — it travels through the app's
+/// `mpsc` channel.
 #[derive(Debug, Clone, Copy)]
 pub struct Target {
-    pub hwnd: isize,
-    pub thread_id: u32,
-    pub focus_child: isize,
-    pub cursor: (i32, i32),
-    /// Whether this window's process runs at a higher integrity level than
-    /// ours (plan §5/F11) — if so, `SendInput` targeting it will be
-    /// silently dropped by UIPI, so delivery must refuse to type rather
-    /// than fail invisibly.
-    pub elevated_beyond_us: bool,
+    hwnd: isize,
+    thread_id: u32,
+    focus_child: isize,
+    cursor: (i32, i32),
+    /// `Some(BlockReason::Elevated)` when this window's process runs at a
+    /// higher integrity level than ours (plan §5/F11) — `SendInput`
+    /// targeting it is silently dropped by UIPI, so delivery must refuse to
+    /// type rather than fail invisibly.
+    blocked: Option<BlockReason>,
+}
+
+impl Target {
+    /// The cursor position at hotkey-press time (see `cursor_pos` for the
+    /// live equivalent).
+    pub fn cursor(&self) -> (i32, i32) {
+        self.cursor
+    }
+
+    /// Why synthetic keystrokes into this target would be blocked, if they
+    /// would be.
+    pub fn blocked(&self) -> Option<BlockReason> {
+        self.blocked
+    }
+
+    /// Whether the target window is still alive — it may have closed in the
+    /// time it took to pick an item from the popup.
+    pub fn still_valid(&self) -> bool {
+        is_window(self.hwnd)
+    }
+
+    /// Whether the target is currently the foreground window — the poll
+    /// `VerifyForeground` (plan §4) uses instead of a blind sleep.
+    pub fn is_foreground(&self) -> bool {
+        is_foreground(self.hwnd)
+    }
 }
 
 /// Captures the current foreground window and cursor position. Must be
@@ -79,7 +111,8 @@ pub fn capture_target(our_integrity_rid: u32) -> Option<Target> {
             thread_id,
             focus_child,
             cursor: cursor_pos(),
-            elevated_beyond_us: integrity::target_is_higher(pid, our_integrity_rid),
+            blocked: integrity::target_is_higher(pid, our_integrity_rid)
+                .then_some(BlockReason::Elevated),
         })
     }
 }
@@ -167,14 +200,16 @@ pub fn activate_target(target: &Target) {
     }
 }
 
-/// Whether `hwnd` still refers to a live window — a target may have closed
-/// in the time it took to pick an item from the popup.
-pub fn is_window(hwnd: isize) -> bool {
+/// Whether `hwnd` still refers to a live window. Backs `Target::still_valid`
+/// — private since callers outside this module go through that method
+/// instead of a raw `hwnd`.
+fn is_window(hwnd: isize) -> bool {
     unsafe { IsWindow(hwnd as HWND) != 0 }
 }
 
-/// Whether `hwnd` is currently the foreground window — the poll
-/// `VerifyForeground` (plan §4) uses instead of a blind sleep.
-pub fn is_foreground(hwnd: isize) -> bool {
+/// Whether `hwnd` is currently the foreground window. Backs
+/// `Target::is_foreground`, kept private for the same reason as
+/// `is_window`.
+fn is_foreground(hwnd: isize) -> bool {
     unsafe { GetForegroundWindow() as isize == hwnd }
 }

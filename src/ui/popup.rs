@@ -7,6 +7,7 @@ use eframe::egui;
 use egui::emath::GuiRounding;
 
 use crate::bw::model::Entry;
+use crate::platform::BlockReason;
 
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xcc, 0x88, 0x00);
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xcc, 0x33, 0x33);
@@ -112,7 +113,9 @@ pub struct ListInfo<'a> {
     /// An inline reason the last delivery attempt couldn't proceed (no
     /// username, no TOTP configured).
     pub message: Option<&'a str>,
-    pub target_elevated: bool,
+    /// Why the current target can't receive synthetic keystrokes, if it
+    /// can't — see `platform::BlockReason`.
+    pub target_blocked: Option<BlockReason>,
     pub icon_mode: IconMode,
 }
 
@@ -152,11 +155,21 @@ pub fn showing_list(
                 info.hidden_by_cap
             ));
         }
-        if info.target_elevated {
-            ui.colored_label(
-                WARNING_COLOR,
-                "Target runs elevated — typing would be blocked. Enter will abort.",
-            );
+        if let Some(reason) = info.target_blocked {
+            let text = match reason {
+                BlockReason::Elevated => {
+                    "Target runs elevated — typing would be blocked. Enter will abort."
+                }
+                BlockReason::NoAccessibility => {
+                    "Accessibility permission not granted — typing would be blocked. Enter will \
+                     abort."
+                }
+                BlockReason::SecureInput => {
+                    "Target field has secure input active — typing would be blocked. Enter will \
+                     abort."
+                }
+            };
+            ui.colored_label(WARNING_COLOR, text);
         }
         if let Some(msg) = info.message {
             ui.colored_label(ERROR_COLOR, msg);

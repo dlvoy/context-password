@@ -49,9 +49,10 @@ use crate::msg::{BwCmd, BwResult, Msg, TrayCmd};
 use crate::secret::Secret;
 use crate::ui::config_window;
 use crate::ui::config_window::ConfigWindowState;
+use crate::platform;
+use crate::platform::focus::{self, ActivationResult, Target};
 use crate::ui::popup::IconMode;
-use crate::win::focus::{self, ActivationResult, Target};
-use crate::{bw, tray, win};
+use crate::{bw, tray};
 
 const MODIFIER_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const FOREGROUND_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -86,10 +87,10 @@ const LIST_CHROME_HEIGHT: f32 = 100.0;
 /// never make quitting feel stuck.
 const LOCK_ON_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Square size (96-DPI-equivalent points) of the autotype indicator —
-/// `win::monitor::placement_for` scales it per-monitor the same way it does
+/// `platform::monitor::placement_for` scales it per-monitor the same way it does
 /// `POPUP_SIZE`.
 const INDICATOR_SIZE_PT: i32 = 32;
-/// `win::typing::send_unicode` is a single non-blocking `SendInput` burst,
+/// `platform::typing::send_unicode` is a single non-blocking `SendInput` burst,
 /// so without a floor the keyboard glyph could flash by in under a frame —
 /// hold it at least this long regardless of how fast typing actually was.
 const INDICATOR_MIN_TYPING: Duration = Duration::from_millis(400);
@@ -356,7 +357,7 @@ enum IndicatorPhase {
 
 /// `None` means "hide the indicator". Pure function of its inputs, in the
 /// same spirit as `ui::config_window::capture_hotkey` and
-/// `win::monitor::place_within` — so it's unit tested directly rather than
+/// `platform::monitor::place_within` — so it's unit tested directly rather than
 /// through the whole delivery machine.
 fn next_indicator_phase(phase: IndicatorPhase, now: Instant) -> Option<IndicatorPhase> {
     match phase {
@@ -441,14 +442,14 @@ impl App {
         hotkey: Hotkey,
         cfg: Config,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let hwnd = win::window_style::hwnd_of(cc).ok_or_else(
+        let hwnd = platform::window_style::hwnd_of(cc).ok_or_else(
             || -> Box<dyn std::error::Error + Send + Sync> {
                 "failed to obtain the native window handle".into()
             },
         )?;
-        win::window_style::make_tool_window(hwnd);
+        platform::window_style::make_tool_window(hwnd);
         // Before the first paint — see `park_offscreen`'s doc for why.
-        win::window_style::park_offscreen(hwnd);
+        platform::window_style::park_offscreen(hwnd);
 
         // `ThemePreference::System` is egui's default already, so this is
         // just making the intent explicit — egui reads the OS theme from
@@ -459,7 +460,7 @@ impl App {
 
         // Cached once: never changes for the process's lifetime, and every
         // hotkey press needs it to evaluate the target's elevation (plan §5).
-        let our_integrity_rid = win::integrity::our_integrity_rid();
+        let our_integrity_rid = platform::integrity::our_integrity_rid();
 
         let (tx, rx) = mpsc::channel();
 
@@ -843,12 +844,12 @@ impl App {
                 // modifiers (and just pressed Enter) when delivery starts;
                 // typing before they're up would have the target see
                 // WM_CHAR with a modifier held and misinterpret it.
-                if win::typing::modifiers_up() || Instant::now() >= delivery.deadline {
+                if platform::typing::modifiers_up() || Instant::now() >= delivery.deadline {
                     delivery.phase = DeliveryPhase::Activate;
                 }
             }
             DeliveryPhase::Activate => {
-                if !focus::is_window(delivery.target.hwnd) {
+                if !delivery.target.still_valid() {
                     eprintln!("delivery aborted: target window no longer exists");
                     done = true;
                 } else {
@@ -861,7 +862,7 @@ impl App {
                 // Polled, not a blind sleep: typing into whatever happens
                 // to be focused if activation silently failed would be the
                 // worst possible outcome here.
-                if focus::is_foreground(delivery.target.hwnd) {
+                if delivery.target.is_foreground() {
                     delivery.phase = DeliveryPhase::Settle;
                     delivery.deadline =
                         Instant::now() + Duration::from_millis(u64::from(self.cfg.type_settle_ms));
@@ -872,13 +873,13 @@ impl App {
             }
             DeliveryPhase::Settle => {
                 if Instant::now() >= delivery.deadline {
-                    if delivery.target.elevated_beyond_us {
+                    if let Some(reason) = delivery.target.blocked() {
                         eprintln!(
-                            "delivery aborted: target runs elevated; SendInput would be \
-                             silently blocked by UIPI"
+                            "delivery aborted: target can't receive synthetic keystrokes \
+                             ({reason:?})"
                         );
                     } else {
-                        let skipped = win::typing::send_unicode(delivery.secret.expose());
+                        let skipped = platform::typing::send_unicode(delivery.secret.expose());
                         eprintln!(
                             "delivery: typed the selected password ({skipped} code unit(s) skipped)"
                         );
@@ -904,14 +905,14 @@ impl App {
     }
 
     /// Shows the autotype indicator at the *live* cursor position (not
-    /// `target.cursor`, which is frozen at hotkey-press time — the user may
-    /// have moved the mouse since) as the keyboard glyph.
+    /// `target.cursor()`, which is frozen at hotkey-press time — the user
+    /// may have moved the mouse since) as the keyboard glyph.
     fn show_indicator(&mut self) {
         let cursor = focus::cursor_pos();
         let placement =
-            win::monitor::placement_for(Some(cursor), INDICATOR_SIZE_PT, INDICATOR_SIZE_PT);
-        win::indicator::show(
-            win::indicator::Kind::Typing,
+            platform::monitor::placement_for(Some(cursor), INDICATOR_SIZE_PT, INDICATOR_SIZE_PT);
+        platform::indicator::show(
+            platform::indicator::Kind::Typing,
             placement.x,
             placement.y,
             placement.w,
@@ -924,7 +925,7 @@ impl App {
 
     fn hide_indicator(&mut self) {
         self.indicator = None;
-        win::indicator::hide();
+        platform::indicator::hide();
     }
 
     /// Advances the indicator's own timer, independent of `delivery` (which
@@ -940,7 +941,7 @@ impl App {
                 if matches!(phase, IndicatorPhase::Typing { .. })
                     && matches!(next, IndicatorPhase::Done { .. })
                 {
-                    win::indicator::set_kind(win::indicator::Kind::Done);
+                    platform::indicator::set_kind(platform::indicator::Kind::Done);
                 }
                 self.indicator = Some(next);
                 ctx.request_repaint_after(POLL_INTERVAL);
@@ -1159,10 +1160,7 @@ impl App {
     /// machine (plan §4). `item_log_line` is only ever printed when
     /// `debug_log` is on (plan §8).
     fn begin_delivery(&mut self, target: Target, secret: Secret, item_log_line: &str) {
-        eprintln!(
-            "delivery: starting for target hwnd={} (elevated_beyond_us={})",
-            target.hwnd, target.elevated_beyond_us
-        );
+        eprintln!("delivery: starting for target {target:?}");
         if self.cfg.debug_log {
             eprintln!("delivery: item {item_log_line}");
         }
@@ -1192,7 +1190,7 @@ impl App {
         self.popup.content = Content::Settings(ConfigWindowState {
             hotkey_spec: self.hotkey.spec(),
             recording: false,
-            autostart: win::autostart::is_enabled(),
+            autostart: platform::autostart::is_enabled(),
             lock_on_exit: self.cfg.lock_on_exit,
             auto_unlock: self.cfg.unlock_mode == UnlockMode::Delayed,
             // Clamped, not the raw field: a config saved before this
@@ -1239,7 +1237,7 @@ impl App {
         }
 
         if state.autostart != self.cfg.autostart {
-            match win::autostart::set_enabled(state.autostart) {
+            match platform::autostart::set_enabled(state.autostart) {
                 Ok(()) => {
                     eprintln!(
                         "settings: autostart {}",
@@ -1397,12 +1395,12 @@ impl eframe::App for App {
                     }
                     _ => POPUP_SIZE,
                 };
-                let cursor = self.popup.target.map(|t| t.cursor);
-                let placement = win::monitor::placement_for(cursor, w_pt, h_pt);
+                let cursor = self.popup.target.map(|t| t.cursor());
+                let placement = platform::monitor::placement_for(cursor, w_pt, h_pt);
                 // Reapply defensively — M1 found this doesn't reliably
                 // survive a visibility transition (see window_style.rs).
-                win::window_style::make_tool_window(self.hwnd);
-                win::window_style::place(
+                platform::window_style::make_tool_window(self.hwnd);
+                platform::window_style::place(
                     self.hwnd,
                     placement.x,
                     placement.y,
@@ -1482,7 +1480,7 @@ impl eframe::App for App {
                 let max_visible = self.cfg.effective_max_visible();
                 let entries = &all_entries[..all_entries.len().min(max_visible)];
                 let hidden_by_cap = all_entries.len().saturating_sub(max_visible);
-                let elevated = self.popup.target.is_some_and(|t| t.elevated_beyond_us);
+                let blocked = self.popup.target.and_then(|t| t.blocked());
                 let kind = DeliveryKind::from_modifiers(ui.input(|i| i.modifiers));
                 if let Some(clicked) = crate::ui::popup::showing_list(
                     ui,
@@ -1492,7 +1490,7 @@ impl eframe::App for App {
                         dropped,
                         hidden_by_cap,
                         message: message.as_deref(),
-                        target_elevated: elevated,
+                        target_blocked: blocked,
                         icon_mode: kind.icon_mode(),
                     },
                 ) {
