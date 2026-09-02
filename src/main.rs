@@ -6,9 +6,10 @@
 mod app;
 mod bw;
 mod config;
-#[cfg(windows)]
 mod controller;
 mod hotkey;
+#[cfg(target_os = "macos")]
+mod mac_ui;
 mod msg;
 mod platform;
 mod secret;
@@ -16,6 +17,7 @@ mod tray;
 #[cfg(windows)]
 mod ui;
 
+#[cfg(windows)]
 use config::Config;
 use platform::singleton::SingleInstance;
 
@@ -66,9 +68,9 @@ fn main() {
     }
 }
 
-/// macOS entry point. Phase 1 stub: proves the singleton guard, config
-/// loading, and the `platform::mac` module shape all compile and run — the
-/// real hotkey/tray/popup wiring lands in `src/mac_ui/` (port plan Phase 5).
+/// macOS entry point (port plan Phase 5). Config is loaded again inside
+/// `mac_ui::app_delegate::setup` — see that module's doc for why the
+/// hotkey can't be registered this early the way Windows' arm does it.
 #[cfg(target_os = "macos")]
 fn main() {
     let Some(_instance_guard) = SingleInstance::acquire() else {
@@ -76,10 +78,10 @@ fn main() {
         return;
     };
 
-    let cfg = load_config();
-    eprintln!("context-password starting (hotkey={}) — macOS stub, no UI yet", cfg.hotkey);
+    mac_ui::run();
 }
 
+#[cfg(windows)]
 fn load_config() -> Config {
     match Config::load() {
         Ok(cfg) => cfg,

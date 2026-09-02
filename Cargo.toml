@@ -53,6 +53,18 @@ objc2-app-kit = { version = "0.3", features = [
     "NSBezierPath",
     "NSGraphics",
     "NSGraphicsContext",
+    "NSControl",
+    "NSTextField",
+    "NSSecureTextField",
+    "NSButton",
+    "NSButtonCell",
+    "NSProgressIndicator",
+    "NSFont",
+    "NSText",
+    "NSTextContent",
+    "NSTextView",
+    "NSNibDeclarations",
+    "NSCell",
 ] }
 
 [target.'cfg(windows)'.dependencies.windows-sys]
