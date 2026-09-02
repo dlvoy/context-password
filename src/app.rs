@@ -45,7 +45,7 @@ use zeroize::Zeroizing;
 use crate::bw::model::Entry;
 use crate::config::{Config, UnlockMode};
 use crate::hotkey::Hotkey;
-use crate::msg::{BwCmd, BwResult, Msg, TrayCmd};
+use crate::msg::{BwCmd, BwResult, Msg, StaleNotice, TrayCmd};
 use crate::secret::Secret;
 use crate::ui::config_window;
 use crate::ui::config_window::ConfigWindowState;
@@ -426,6 +426,16 @@ pub struct App {
     /// section). `None` means "never unlocked yet" and is what routes the
     /// popup to `Prompting` instead of `ShowingList`.
     cached_entries: Option<(Vec<Entry>, usize)>,
+    /// Set whenever the most recent sync attempt (from a fresh unlock or
+    /// the tray's Sync item) failed and `cached_entries` is therefore
+    /// possibly stale — cleared the moment a sync actually succeeds.
+    /// Deliberately not part of `Content::ShowingList`: unlike `message`,
+    /// this must survive a selection change, since it describes the *data*
+    /// rather than the last action. Also what makes a sync failure visible
+    /// even when it happened in the background (popup on Settings/About/a
+    /// fresh prompt) rather than being dropped entirely — see
+    /// `handle_bw_result`'s `Failed` arm.
+    sync_stale: Option<StaleNotice>,
     /// Set while the Settings screen has temporarily unregistered the live
     /// hotkey so it can be re-captured (see `Hotkey::suspend`) — tracked
     /// here rather than derived from `ConfigWindowState.recording` so the
@@ -557,6 +567,7 @@ impl App {
             indicator: None,
             stats: ActivationStats::default(),
             cached_entries: None,
+            sync_stale: None,
             hotkey_suspended: false,
             vault_state: VaultState::Locked,
             exit_state: ExitState::NotExiting,
@@ -648,6 +659,7 @@ impl App {
     fn handle_lock(&mut self) {
         eprintln!("lock: clearing cached items and locking the vault");
         self.cached_entries = None;
+        self.sync_stale = None;
         if self.hotkey_suspended {
             // Settings might be mid-recording when a global Lock action
             // interrupts it — don't leave the hotkey unregistered with
@@ -689,7 +701,7 @@ impl App {
     /// back into the popup if it's waiting on them.
     fn handle_bw_result(&mut self, result: BwResult) {
         match result {
-            BwResult::Items { entries, dropped } => {
+            BwResult::Items { entries, dropped, stale } => {
                 // A Sync can be in flight when the tray's Lock item — still
                 // visible throughout a sync, since `vault_state` stays
                 // `Unlocked` — fires and clears `cached_entries` right out
@@ -718,7 +730,17 @@ impl App {
                         eprintln!("  {}", entry.log_line());
                     }
                 }
+                if self.cfg.debug_log
+                    && let Some(notice) = &stale
+                {
+                    eprintln!(
+                        "bw: sync did not succeed ({}): {} — showing the cached list anyway",
+                        notice.reason.summary(),
+                        notice.detail
+                    );
+                }
                 self.cached_entries = Some((entries, dropped));
+                self.sync_stale = stale;
                 self.set_vault_state(VaultState::Unlocked);
                 if matches!(self.popup.content, Content::Unlocking | Content::Syncing) {
                     self.popup.content = Content::ShowingList {
@@ -738,13 +760,37 @@ impl App {
                     }
                 }
             }
-            BwResult::Failed { stage, message } => {
+            BwResult::Failed { stage, kind, message } => {
                 eprintln!("bw: failed at {stage}: {message}");
+                if stage == "sync" {
+                    // A sync only ever reaches `Failed` (rather than
+                    // `Items { stale: Some(_), .. }`) via a hard failure —
+                    // no session to sync with, or `bw` itself couldn't be
+                    // resolved/spawned — never a plain non-zero exit, which
+                    // `sync_then_list` already turns into a `StaleNotice`
+                    // alongside a still-usable list. Record it the same way
+                    // regardless of what the popup happens to be showing
+                    // right now, so the banner still appears the next time
+                    // the list is shown rather than being silently dropped
+                    // (the `_ => {}` arm below, when the popup is on
+                    // Settings/About/a fresh prompt during a background
+                    // sync).
+                    self.sync_stale = Some(StaleNotice {
+                        reason: kind,
+                        last_sync: None,
+                        detail: message.clone(),
+                    });
+                }
                 match &self.popup.content {
                     Content::Unlocking => {
+                        // `message` is already a complete, user-facing
+                        // sentence by this point for every stage that can
+                        // reach `Unlocking` ("resolve"'s own error text, or
+                        // `precise_unlock_message`'s classification-driven
+                        // text for "unlock") — no "{stage}: " prefix needed.
                         self.popup.content = Content::Prompting {
                             password: Zeroizing::new(String::with_capacity(256)),
-                            error: Some(format!("{stage}: {message}")),
+                            error: Some(message.clone()),
                             revealed: false,
                         };
                     }
@@ -1492,6 +1538,7 @@ impl eframe::App for App {
                         hidden_by_cap,
                         message: message.as_deref(),
                         target_blocked: blocked,
+                        stale: self.sync_stale.as_ref(),
                         icon_mode: kind.icon_mode(),
                     },
                 ) {

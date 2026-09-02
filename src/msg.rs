@@ -2,6 +2,7 @@
 //! `App::logic`). Tray, hotkey, and `bw` worker events all funnel into this
 //! so there is exactly one place that decides what an event means.
 
+use crate::bw::error::BwErrorKind;
 use crate::bw::model::Entry;
 use crate::platform::focus::Target;
 use crate::secret::Secret;
@@ -51,11 +52,37 @@ pub enum BwCmd {
     GetTotp(String),
 }
 
+/// Carried on `BwResult::Items` when the list came from the local cache
+/// because the `bw sync` that preceded it failed — the graceful-degradation
+/// case the self-hosted-vault-behind-an-intermittently-blocked-domain
+/// scenario needs: the vault keeps working, but the user is told the data
+/// might be stale rather than being left to assume it's current.
+pub struct StaleNotice {
+    pub reason: BwErrorKind,
+    /// From a `bw status` probe's `lastSync` field (RFC3339), when that
+    /// probe itself succeeded. `None` if the probe also failed or the vault
+    /// has never synced on this machine.
+    pub last_sync: Option<String>,
+    /// The real `bw` message, for the log and the tooltip — never shown
+    /// verbatim in the banner itself, which uses `reason.summary()`.
+    pub detail: String,
+}
+
 /// Results the `bw` worker sends back. Never carries the session key —
 /// that stays inside the worker for the process's lifetime (plan §7).
 pub enum BwResult {
-    Items { entries: Vec<Entry>, dropped: usize },
-    Failed { stage: &'static str, message: String },
+    /// `stale: Some(_)` when this list is the local cache from before a
+    /// failed sync, rather than confirmed fresh — see `StaleNotice`.
+    Items {
+        entries: Vec<Entry>,
+        dropped: usize,
+        stale: Option<StaleNotice>,
+    },
+    Failed {
+        stage: &'static str,
+        kind: BwErrorKind,
+        message: String,
+    },
     /// `bw lock` finished (successfully or not — see `BwCmd::Lock`'s doc).
     Locked,
     Totp(Secret),

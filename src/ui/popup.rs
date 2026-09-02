@@ -7,6 +7,7 @@ use eframe::egui;
 use egui::emath::GuiRounding;
 
 use crate::bw::model::Entry;
+use crate::msg::StaleNotice;
 use crate::platform::BlockReason;
 
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xcc, 0x88, 0x00);
@@ -116,7 +117,27 @@ pub struct ListInfo<'a> {
     /// Why the current target can't receive synthetic keystrokes, if it
     /// can't — see `platform::BlockReason`.
     pub target_blocked: Option<BlockReason>,
+    /// Non-transient (unlike `message`, which clears on the next selection
+    /// change): set for as long as this list is the local cache from
+    /// before a `bw sync` that failed, so the user always knows when
+    /// they're looking at possibly-stale data rather than only at the
+    /// moment the sync happened to fail.
+    pub stale: Option<&'a StaleNotice>,
     pub icon_mode: IconMode,
+}
+
+/// The banner text for a stale list — deliberately short and free of the
+/// raw `bw` message (which can be a multi-line Node stack trace): just
+/// enough that the user knows to distrust freshness, not why (`notice.detail`
+/// is for the log, not this label). `last_sync` is the one piece of the
+/// underlying `bw status` probe worth surfacing here — a raw RFC3339
+/// timestamp rather than a "3 hours ago"-style relative rendering, since
+/// that would need a date/time dependency this app doesn't otherwise carry.
+pub fn stale_banner_text(notice: &StaleNotice) -> String {
+    match &notice.last_sync {
+        Some(ts) => format!("Offline — showing the cached vault (last synced {ts})."),
+        None => "Offline — showing the cached vault, which may be stale.".to_string(),
+    }
 }
 
 /// Returns the index of a clicked row, if any. `entries` is already
@@ -154,6 +175,9 @@ pub fn showing_list(
                 "({} more not shown — raise Max visible items in Settings)",
                 info.hidden_by_cap
             ));
+        }
+        if let Some(notice) = info.stale {
+            ui.colored_label(WARNING_COLOR, stale_banner_text(notice));
         }
         if let Some(reason) = info.target_blocked {
             let text = match reason {
