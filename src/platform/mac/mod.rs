@@ -10,5 +10,6 @@ pub mod autostart;
 pub mod focus;
 pub mod indicator;
 pub mod monitor;
+pub mod permissions;
 pub mod singleton;
 pub mod typing;
