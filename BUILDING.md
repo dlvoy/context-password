@@ -14,8 +14,8 @@
 
 - **Rust**, MSVC toolchain — `rustup default stable-x86_64-pc-windows-msvc`. The crate is on
   edition 2024 and was built and tested against rustc 1.97.1; anything close to that works.
-- **Windows 10 or 11**. The app is Windows-only throughout (`windows-sys`, `RegisterHotKey`,
-  `SendInput`) — it will not build for any other target.
+- **Windows 10 or 11**, to build the full app today. A macOS port is in progress but not yet
+  buildable end to end — see [macOS](#macos-work-in-progress) below.
 - Building the installers additionally needs:
   - **`cargo-wix`** (`cargo install cargo-wix`) and the **WiX Toolset v3** (`choco install
     wixtoolset`, or download from the WiX Toolset website) for the MSI.
@@ -71,6 +71,56 @@ makensis packaging\installer.nsi
 Pass `/DPRODUCT_VERSION=x.y.z` to stamp a specific version into the installer's metadata and
 filename; without it, the installer is named with a `0.0.0` placeholder. `cargo bundle` does this
 automatically, reading the version straight from `Cargo.toml`.
+
+## macOS (work in progress)
+
+The macOS port isn't finished — full status, the phased plan, and the design decisions behind it
+live in `../context-password-project/plan/macos-port-plan.md`, a sibling repo to this one (kept
+outside `context-password` itself so the plan can be pulled onto another machine independently of
+this repo's history). This section only covers what needs to be installed to pick the work back up.
+
+### Prerequisites
+
+- **A real Mac.** Apple licenses the macOS SDK for use on Apple hardware only, and the actually
+  risky parts of this port — the Accessibility/TCC permission, Secure Input, and WindowServer's
+  synthetic-event filtering — can only be observed on real hardware. See the plan's Phase 0.
+- **Xcode Command Line Tools**: `xcode-select --install`. Provides the macOS SDK, `clang`,
+  `codesign`, `lipo`, `iconutil`, `sips`, and `hdiutil` — everything Phase 4's packaging needs, and
+  what linking the `objc2`/AppKit bindings from Phase 2 onward requires.
+- **Rust**, same edition and version as Windows (edition 2024, tested against rustc 1.97.1) —
+  `rustup default stable` is enough for the host architecture. For the universal binary Phase 4
+  calls for: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
+- **The Bitwarden CLI** (`bw`): `brew install bitwarden-cli` (or `npm install -g @bitwarden/cli`),
+  then `bw login` / `bw unlock` as in the main [README](README.md#setting-up-bitwarden). Homebrew
+  installs to `/opt/homebrew/bin` on Apple Silicon or `/usr/local/bin` on Intel — neither is on the
+  minimal `PATH` a GUI-launched `.app` inherits, which is why the macOS arm of `bw::exe`'s discovery
+  (Phase 2, not yet written) has to check both locations plus `~/.npm-global/bin` explicitly, the
+  same way the `bw_path` Settings override is the escape hatch on Windows.
+- For packaging, once Phase 4 starts: `cargo install cargo-packager`, for `.app`/`.dmg` bundling.
+  Signing and notarization use `codesign`/`notarytool` from Xcode Command Line Tools, already
+  above — ad-hoc signing needs nothing further; a paid Developer ID identity is only needed to turn
+  on real notarization later.
+
+### Where things stand
+
+`cargo build`/`cargo test` on macOS itself won't fully succeed yet: `src/app.rs`, `src/ui/`, and
+`main.rs` are still unconditionally Windows/`eframe`-specific and haven't been split out from the
+future `mac_ui` front-end (tracked in the plan as the deferred step 1d). What already compiles
+cleanly for a macOS target today is the shared core underneath that UI layer — `src/bw/`,
+`src/config.rs`, `src/secret.rs`, `src/msg.rs`, `src/hotkey.rs`, `src/tray.rs`, and the
+`src/platform/` `#[cfg]` switch itself (`src/platform/win/` behind `#[cfg(windows)]`, with
+`src/platform/mac/` still to come). That was verified without a Mac at all, from Windows, since
+`rustup target add aarch64-apple-darwin` downloads a prebuilt std even without the SDK:
+
+```
+rustup target add aarch64-apple-darwin
+cargo check --target aarch64-apple-darwin
+```
+
+This type-checks everything but can't link (no SDK), so it stops at the still-Windows-only files
+rather than succeeding outright — useful as a quick way to catch a shared file accidentally picking
+up Windows-only code, from either machine. On the Mac itself, once there's a macOS entry point to
+check against, plain `cargo check` (no `--target`) is the equivalent sanity check against the host.
 
 ## Project layout
 
