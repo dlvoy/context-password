@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-04
+
+### Added
+
+- macOS builds can now be packaged into a proper `.app`/`.dmg`, with an app icon and ad-hoc code
+  signing by default — this is what "Open at Login" needs, since `SMAppService` requires a real
+  app bundle rather than a bare dev binary. See `BUILDING.md` for how to build one, and the
+  Developer ID signing doc referenced there for notarized builds.
+
 ## [1.4.0] - 2026-09-04
 
 ### Added
