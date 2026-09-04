@@ -19,6 +19,8 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use super::error::classify;
+use crate::vault::VaultErrorKind;
 use super::exe::BwExe;
 use super::run::{self, Run};
 
@@ -68,27 +70,83 @@ fn base(exe: &BwExe) -> Command {
     cmd
 }
 
+/// Runs `build()`'s command; if it fails with a `Tls`-classified error (this
+/// machine's corporate proxy intercepting the vault's TLS connection and
+/// presenting its own certificate — see `vault::VaultErrorKind::Tls`), runs it
+/// a second time with certificate verification disabled for that one child
+/// process, exactly as the user confirmed manually (`NODE_TLS_REJECT_
+/// UNAUTHORIZED=0 bw unlock`) gets past it. `build` a closure rather than a
+/// single `Command` because a `Command` can't be re-spawned after use, and
+/// the two attempts otherwise need identical args/env.
+///
+/// Deliberately narrow: only a `Tls` classification retries. A `Network`
+/// classification (DNS failure, connection refused, a genuinely blackholed
+/// link) would just fail the same way again with verification off — that's
+/// not what this environment variable fixes — so retrying there would only
+/// double the wait before the graceful-degradation path (stale vault /
+/// "can't reach the server") kicks in.
+///
+/// Returns whether the insecure retry actually ran, alongside the `Run` it
+/// produced (or the first `Run`, if no retry was needed) — `unlock_sync_
+/// list` uses that to skip the `bw sync` that would otherwise immediately
+/// follow a successful unlock: `sync`/`list_items` are deliberately *not*
+/// given this same fallback (see their own docs — going through to the
+/// intercepting host crashes them), so if unlock only got through this way,
+/// a sync attempt right after is known to just fail again, for no benefit.
+fn run_with_tls_fallback(build: impl Fn() -> Command, timeout: Duration) -> io::Result<(Run, bool)> {
+    let first = run::run(build(), timeout)?;
+    if first.success() || classify(&first.stderr, first.timed_out) != VaultErrorKind::Tls {
+        return Ok((first, false));
+    }
+    eprintln!(
+        "bw: TLS certificate mismatch talking to the vault server (corporate proxy/MITM \
+         suspected) — retrying this call with certificate verification disabled"
+    );
+    let mut insecure = build();
+    insecure.env("NODE_TLS_REJECT_UNAUTHORIZED", "0");
+    Ok((run::run(insecure, timeout)?, true))
+}
+
 /// `bw unlock --raw`, with the master password passed via `--passwordenv`
 /// — **never** as a positional argument. `bw unlock myPassword321` is the
 /// form shown in the CLI's own help text, and is the obvious thing to
 /// "simplify" this to. Don't: see the module doc for why.
-pub fn unlock(exe: &BwExe, master_password: &str) -> io::Result<Run> {
-    let mut cmd = base(exe);
-    cmd.args([
-        "unlock",
-        "--raw",
-        "--nointeraction",
-        "--passwordenv",
-        "CP_MASTERPW",
-    ])
-    .env("CP_MASTERPW", master_password);
-    run::run(cmd, UNLOCK_TIMEOUT)
+pub fn unlock(exe: &BwExe, master_password: &str) -> io::Result<(Run, bool)> {
+    run_with_tls_fallback(
+        || {
+            let mut cmd = base(exe);
+            cmd.args([
+                "unlock",
+                "--raw",
+                "--nointeraction",
+                "--passwordenv",
+                "CP_MASTERPW",
+            ])
+            .env("CP_MASTERPW", master_password);
+            cmd
+        },
+        UNLOCK_TIMEOUT,
+    )
 }
 
 /// `bw sync`, session passed via `BW_SESSION` (which `--session` reads from
 /// by default) — never `--session KEY` on argv (plan F9): the session key
 /// decrypts the whole vault and deserves the same argv hygiene as the
 /// master password.
+///
+/// Deliberately **not** run through `run_with_tls_fallback` — confirmed by
+/// manual testing to be actively harmful here, unlike `unlock`. Behind this
+/// machine's Zscaler, the vault's domain resolves to a corporate
+/// block-notice host; with certificate verification on, `bw sync`'s TLS
+/// handshake to it fails cleanly (a `Tls`-classified error, handled by
+/// `sync_then_list`'s existing stale-vault fallback below). With
+/// verification disabled, the handshake succeeds and `bw sync` receives that
+/// host's HTML block page where it expected JSON — which it does not handle
+/// gracefully: it throws an uncaught exception and the whole `bw` process
+/// crashes mid-sync, observed to leave the local vault cache (`data.json`)
+/// corrupted (a bad cached `Policy.revisionDate`), which then broke *every*
+/// later `bw list items` call with `bitwarden_crypto` decryption errors —
+/// nothing to do with the master password despite how that first presented.
 pub fn sync(exe: &BwExe, session_key: &str) -> io::Result<Run> {
     let mut cmd = base(exe);
     cmd.args(["sync", "--nointeraction"])
@@ -100,6 +158,11 @@ pub fn sync(exe: &BwExe, session_key: &str) -> io::Result<Run> {
 /// must still re-filter client-side on `login.uris[].uri` — `--search` is a
 /// fuzzy match across many fields (see `bw::filter`), not an exact prefix
 /// match.
+///
+/// Not run through `run_with_tls_fallback` either — same reasoning as
+/// `sync` above: unverified, but presumed to risk the identical
+/// crash-on-malformed-response failure mode if it ever needs the network,
+/// which a clean `Tls`/`Network`-classified failure here does not.
 pub fn list_items(exe: &BwExe, session_key: &str, search_term: &str) -> io::Result<Run> {
     let mut cmd = base(exe);
     cmd.args(["list", "items", "--nointeraction", "--search", search_term])
@@ -122,7 +185,11 @@ pub fn lock(exe: &BwExe) -> io::Result<Run> {
 /// `bw get totp <item_id> --raw`, session via `BW_SESSION` like every other
 /// authenticated call. Fetched fresh at the moment of use rather than
 /// computed from the seed locally — see the plan's rationale (reuses
-/// Bitwarden's own algorithm exactly, no local crypto dependency).
+/// Bitwarden's own algorithm exactly, no local crypto dependency). Not run
+/// through `run_with_tls_fallback` — same reasoning as `sync`/`list_items`
+/// above, and this one genuinely needs the real server (a TOTP code from the
+/// wrong host is worthless anyway), so there is nothing for the fallback to
+/// usefully buy here even setting the crash risk aside.
 pub fn get_totp(exe: &BwExe, session_key: &str, item_id: &str) -> io::Result<Run> {
     let mut cmd = base(exe);
     cmd.args(["get", "totp", item_id, "--raw", "--nointeraction"])

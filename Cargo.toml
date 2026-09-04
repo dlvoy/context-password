@@ -1,6 +1,6 @@
 [package]
 name = "context-password"
-version = "1.3.0"
+version = "1.4.0"
 edition = "2024"
 description = "Global-hotkey popup that auto-types Bitwarden passwords via the bw CLI"
 authors = ["Dominik Dzienia"]
@@ -16,6 +16,20 @@ serde_json = "1"
 toml = "1"
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
 log = "0.4"
+
+# KeePass 2 / KDBX provider (src/keepass/). NOT published to crates.io —
+# pinned to an exact commit SHA on a fork under our own account, so upstream
+# can neither vanish nor force-push over the pin. See BUILDING.md for the
+# bump procedure and the reasoning.
+keepass-core = { git = "https://github.com/dlvoy/keepass-core", rev = "7c8f40aa1d0e1b136418e3e437b00da6d1915f49" }
+# TOTP for KeePass entries (Bitwarden's codes still come from `bw get totp`).
+totp-rs = { version = "6.0", default-features = false, features = ["std", "otpauth", "zeroize"] }
+# `keepass_core::model::EntryId` wraps a `uuid::Uuid` directly — needed to
+# parse/format it ourselves in `keepass::model`.
+uuid = "1"
+# Native file picker for the KeePass database path in Settings, both
+# platforms — no picker of any kind existed in this codebase before.
+rfd = "0.17"
 
 # egui/eframe are the Windows front-end only — macOS uses native AppKit
 # (src/mac_ui/, Phase 5 of the port plan). Keeping them target-scoped is what
@@ -65,6 +79,12 @@ objc2-app-kit = { version = "0.3", features = [
     "NSTextView",
     "NSNibDeclarations",
     "NSCell",
+    "NSPopUpButton",
+    "NSMenu",
+    "NSMenuItem",
+    # NSLineBreakMode, for wrapping Settings' error label instead of
+    # clipping it mid-sentence.
+    "NSParagraphStyle",
 ] }
 
 [target.'cfg(windows)'.dependencies.windows-sys]

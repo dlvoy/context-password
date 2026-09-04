@@ -8,32 +8,32 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
-use objc2::runtime::{NSObject, ProtocolObject, Sel};
+use objc2::runtime::{AnyObject, NSObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSControl,
-    NSControlTextEditingDelegate, NSEventModifierFlags, NSTextFieldDelegate, NSTextView,
+    NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSTextFieldDelegate, NSTextView,
+    NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{MainThreadMarker, NSNotification, NSObjectProtocol, NSTimer};
 
-use crate::bw;
-use crate::bw::model::Entry;
 use crate::config::{Config, UnlockMode};
 use crate::controller::{Delivery, DeliveryPhase, IndicatorPhase, VaultState};
 use crate::hotkey::Hotkey;
-use crate::msg::{BwCmd, BwResult, Msg, StaleNotice, TrayCmd};
+use crate::msg::{Msg, StaleNotice, TrayCmd, VaultCmd, VaultResult};
 use crate::platform::focus::{self, Target};
 use crate::platform::{self, BlockReason};
 use crate::secret::Secret;
 use crate::tray;
+use crate::vault::{Entry, Provider, VaultHandle};
 
 use super::about;
-use super::panel::Panel;
+use super::panel::{self, Panel};
 use super::settings::{self, SettingsWindow};
 use super::state::{DeliveryKind, PopupContent};
 
@@ -55,7 +55,7 @@ const INDICATOR_SIZE_PT: i32 = 32;
 struct AppState {
     cfg: Config,
     rx: Receiver<Msg>,
-    bw_cmd_tx: Sender<BwCmd>,
+    vault: VaultHandle,
     hotkey: Hotkey,
     hotkey_suspended: bool,
     tray: tray::TrayHandles,
@@ -69,6 +69,11 @@ struct AppState {
     /// clicked away" until it's been key at least once.
     seen_key: bool,
     cached_entries: Option<(Vec<Entry>, usize)>,
+    /// The row icon's currently-drawn mode — polled from
+    /// `NSEvent::modifierFlags_class()` each tick rather than pushed by an
+    /// event (see `on_tick`'s doc), so this is what tells a poll "nothing
+    /// changed, don't bother re-laying-out the list."
+    last_modifier_kind: DeliveryKind,
     sync_stale: Option<StaleNotice>,
     vault_state: VaultState,
     delivery: Option<Delivery>,
@@ -79,11 +84,17 @@ struct AppState {
 
 pub struct AppIvars {
     state: RefCell<Option<AppState>>,
+    /// Set once in `setup()`, read thereafter — kept in its own `RefCell`
+    /// outside `state` specifically so `windowWillReturnFieldEditor:
+    /// toObject:` never has to borrow `state` at all. See
+    /// `panel::FieldEditorRouting`'s doc for the reentrant-borrow panic
+    /// this avoids.
+    field_editor: RefCell<Option<panel::FieldEditorRouting>>,
 }
 
 impl Default for AppIvars {
     fn default() -> Self {
-        Self { state: RefCell::new(None) }
+        Self { state: RefCell::new(None), field_editor: RefCell::new(None) }
     }
 }
 
@@ -117,7 +128,41 @@ define_class!(
 
     unsafe impl NSTextFieldDelegate for AppDelegate {}
 
+    unsafe impl NSWindowDelegate for AppDelegate {
+        // Supplies `Panel`'s `KeyCatcherEditor` as the field editor
+        // specifically for `list_key_catcher` — see that type's doc in
+        // `panel.rs` for why a custom field editor, not a delegate method
+        // or a `keyDown:` override on the field itself, is what's actually
+        // needed to intercept digit keys. `None` for every other client
+        // (in particular `prompt_field`) falls back to AppKit's own
+        // ordinary shared field editor, unaffected.
+        #[unsafe(method_id(windowWillReturnFieldEditor:toObject:))]
+        unsafe fn window_will_return_field_editor_to_object(
+            &self,
+            _sender: &NSWindow,
+            client: Option<&AnyObject>,
+        ) -> Option<Retained<AnyObject>> {
+            // Deliberately not `self.ivars().state` — see
+            // `panel::FieldEditorRouting`'s doc for why this must never
+            // touch that `RefCell` (AppKit can call this reentrantly from
+            // inside code that already holds it mutably borrowed).
+            match self.ivars().field_editor.borrow().as_ref() {
+                Some(routing) => routing.resolve(client),
+                None => None,
+            }
+        }
+    }
+
     impl AppDelegate {
+        // Called directly via `msg_send!` from `Panel`'s `KeyCatcherEditor`
+        // subclass's `keyDown:` override — not a target/action selector
+        // fired by `NSControl`'s own send-action machinery like
+        // `rowClicked:` below.
+        #[unsafe(method(handleDigitKeyPress))]
+        fn handle_digit_key_press(&self) -> bool {
+            self.handle_digit_key()
+        }
+
         #[unsafe(method(rowClicked:))]
         fn row_clicked(&self, sender: &NSObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
@@ -142,6 +187,21 @@ define_class!(
             {
                 window.hide();
             }
+        }
+
+        #[unsafe(method(settingsProviderChanged:))]
+        fn settings_provider_changed(&self, _sender: &NSObject) {
+            let guard = self.ivars().state.borrow();
+            if let Some(state) = guard.as_ref()
+                && let Some(window) = &state.settings_window
+            {
+                window.sync_provider_rows();
+            }
+        }
+
+        #[unsafe(method(settingsBrowse:))]
+        fn settings_browse(&self, _sender: &NSObject) {
+            self.handle_settings_browse();
         }
     }
 );
@@ -238,23 +298,25 @@ impl AppDelegate {
         tray.set_show_label(false);
         tray.set_unlocked_items_visible(false);
 
-        // The timer alone drains `rx` every tick, so `bw::spawn`'s waker
-        // has nothing to do — unlike Windows' `ctx.request_repaint()`,
+        // The timer alone drains `rx` every tick, so the vault worker's
+        // waker has nothing to do — unlike Windows' `ctx.request_repaint()`,
         // which is the *only* thing that wakes an otherwise-idle egui loop.
-        let bw_cmd_tx = bw::spawn(
-            cfg.bw_path.clone(),
-            cfg.uri_prefix.clone(),
-            tx.clone(),
-            Arc::new(|| {}),
-        );
+        let vault = VaultHandle::spawn(&cfg, tx.clone(), Arc::new(|| {}));
 
         let delegate_protocol = ProtocolObject::from_ref(self);
         let panel = Panel::new(mtm, delegate_protocol);
+        // Required for `windowWillReturnFieldEditor:toObject:` (see that
+        // impl block's doc) to ever be asked at all.
+        panel.panel.setDelegate(Some(ProtocolObject::from_ref(self)));
+        // Snapshotted before `panel` moves into `AppState` below — see
+        // `panel::FieldEditorRouting`'s doc for why this lives outside
+        // `state`'s `RefCell` entirely.
+        *self.ivars().field_editor.borrow_mut() = Some(panel.field_editor_routing());
 
         *self.ivars().state.borrow_mut() = Some(AppState {
             cfg,
             rx,
-            bw_cmd_tx,
+            vault,
             hotkey,
             hotkey_suspended: false,
             tray,
@@ -264,6 +326,7 @@ impl AppDelegate {
             popup_target: None,
             seen_key: false,
             cached_entries: None,
+            last_modifier_kind: DeliveryKind::Password,
             sync_stale: None,
             vault_state: VaultState::Locked,
             delivery: None,
@@ -308,7 +371,7 @@ impl AppDelegate {
                         // `NSApplicationTerminateReply::TerminateLater`,
                         // deferred along with the rest of Settings'
                         // polish). The lock request is still sent.
-                        let _ = state.bw_cmd_tx.send(BwCmd::Lock);
+                        state.vault.send(VaultCmd::Lock);
                     }
                     drop(guard);
                     let mtm = self.mtm();
@@ -321,13 +384,36 @@ impl AppDelegate {
                 Msg::Tray(TrayCmd::Settings) => self.open_settings(state),
                 Msg::Tray(TrayCmd::About) => self.open_about(state),
                 Msg::Hotkey(target) => open_popup(state, Some(target)),
-                Msg::Bw(result) => handle_bw_result(state, result),
+                Msg::Vault { generation, result } => {
+                    // A stale generation means this result is from a
+                    // worker already torn down by a provider switch
+                    // (`respawn`) — drop it rather than resurrecting a
+                    // dead provider's entries into the live one's UI.
+                    if state.vault.accepts(generation) {
+                        handle_vault_result(state, result);
+                    } else if state.cfg.debug_log {
+                        eprintln!("vault: dropping a result from a torn-down worker (generation {generation})");
+                    }
+                }
             }
         }
 
         advance_delivery(state);
         advance_indicator(state);
         check_blur(state);
+        // Live icon swap on held Shift/Option (the macOS counterpart of
+        // Windows' `DeliveryKind::from_modifiers` being recomputed every
+        // egui frame — AppKit has no per-frame hook to piggyback on, so
+        // this tick is it). Narrow and guarded exactly like every other
+        // post-drain step here: `refresh_list` only, never the general
+        // `layout()`-on-a-timer pattern the comment below explains is
+        // unsafe, and only invoked when the mode actually changed.
+        if state.popup_visible
+            && matches!(state.popup_content, PopupContent::ShowingList { .. })
+            && poll_modifier_kind(state)
+        {
+            refresh_list(state);
+        }
         // Deliberately *not* an unconditional `refresh_panel(state)` here
         // — that was a real bug found in manual testing. `Panel::layout`
         // starts by hiding every control (`setHidden(true)`) before
@@ -353,7 +439,69 @@ impl AppDelegate {
         let mut guard = self.ivars().state.borrow_mut();
         let Some(state) = guard.as_mut() else { return };
         let PopupContent::ShowingList { .. } = &state.popup_content else { return };
-        start_delivery(state, index, DeliveryKind::Password);
+        // Same modifier resolution as Enter (`handle_command`) and the
+        // digit shortcuts (`handle_digit_key`): `NSApp.currentEvent()` at
+        // the moment a button's action fires is the click's own `NSEvent`,
+        // carrying the click's modifier flags — a click with Shift/Option
+        // held delivers username/OTP instead of the password, matching
+        // Enter and digits rather than being hardcoded to `Password`.
+        let mtm = self.mtm();
+        let flags = NSApplication::sharedApplication(mtm)
+            .currentEvent()
+            .map(|e| e.modifierFlags())
+            .unwrap_or(NSEventModifierFlags::empty());
+        let kind = DeliveryKind::from_flags(
+            flags.contains(NSEventModifierFlags::Shift),
+            flags.contains(NSEventModifierFlags::Option),
+        );
+        start_delivery(state, index, kind);
+    }
+
+    /// Called from `Panel`'s `KeyCatcher::keyDown:` override for *every*
+    /// key press while the list (or a busy/OTP screen) is showing — see
+    /// that type's doc for why it's wired this way instead of through
+    /// `control:textView:doCommandBySelector:`. Returns whether the key
+    /// was a digit meant for us: `true` means `KeyCatcher` swallows it
+    /// (never reaches `insertText:`/`super.keyDown:`); `false` — not
+    /// `ShowingList`, or not a digit key at all — lets it fall through to
+    /// `super.keyDown:` unchanged, so arrow/Enter/Escape handling via
+    /// `control:textView:doCommandBySelector:` is completely unaffected,
+    /// and this is never even called while `prompt_field` (the master
+    /// password) is focused, since `KeyCatcher` isn't first responder then.
+    fn handle_digit_key(&self) -> bool {
+        eprintln!("AppDelegate::handle_digit_key called");
+        let mut guard = self.ivars().state.borrow_mut();
+        let Some(state) = guard.as_mut() else { return false };
+        if !matches!(state.popup_content, PopupContent::ShowingList { .. }) {
+            return false;
+        }
+
+        let mtm = self.mtm();
+        let Some(event) = NSApplication::sharedApplication(mtm).currentEvent() else {
+            return false;
+        };
+        // Not `replacement_string` — the same problem the Windows digit
+        // handler documents applies here too: Shift+1 produces the
+        // character "!", not "1". `keyCode()` is the raw hardware scan
+        // code, layout-position-based and unaffected by Shift/Option, the
+        // macOS equivalent of the `physical_key` fallback `controller.rs`
+        // uses for exactly this reason.
+        let Some(index) = digit_from_keycode(event.keyCode()) else {
+            return false;
+        };
+        let count = state
+            .cached_entries
+            .as_ref()
+            .map_or(0, |(e, _)| e.len().min(super::panel::MAX_ROWS));
+        if index < count {
+            let flags = event.modifierFlags();
+            let kind = DeliveryKind::from_flags(
+                flags.contains(NSEventModifierFlags::Shift),
+                flags.contains(NSEventModifierFlags::Option),
+            );
+            start_delivery(state, index, kind);
+        }
+        true
     }
 
     /// Shared by the password field and the list's invisible key-catcher
@@ -380,8 +528,9 @@ impl AppDelegate {
                     let password = state.panel.take_password();
                     if !password.is_empty() {
                         *error = None;
-                        let _ = state.bw_cmd_tx.send(BwCmd::Unlock(Secret::new(password)));
+                        state.vault.send(VaultCmd::Unlock(Secret::new(password)));
                         state.popup_content = PopupContent::Unlocking;
+                        show_popup(state);
                     }
                     true
                 } else if is_escape {
@@ -483,7 +632,15 @@ impl AppDelegate {
         hide_popup(state);
         let mtm = self.mtm();
         let window = state.about_window.get_or_insert_with(|| about::build(mtm));
+        // Same activate-before-raise fix as `show_popup`'s (see that
+        // function's doc): this process runs `.accessory`, so a bare
+        // `makeKeyAndOrderFront:` alone doesn't reliably raise the window
+        // above another app's — found in manual testing to affect About
+        // and Settings exactly like it used to affect the popup panel.
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
         window.makeKeyAndOrderFront(None);
+        window.orderFrontRegardless();
     }
 
     /// The Save button's handler — mirrors `App::try_apply_config_window`.
@@ -499,6 +656,32 @@ impl AppDelegate {
         state.settings_window = Some(window);
     }
 
+    /// The Browse… button's handler. Runs `rfd`'s (blocking, modal) picker
+    /// — deliberately *not* while holding the `AppState` borrow: the modal
+    /// run loop can still service this app's `tick:` timer while the panel
+    /// is up, and `tick:` re-borrows `AppState` itself, so holding the
+    /// borrow here would panic the moment a tick fired mid-pick.
+    fn handle_settings_browse(&self) {
+        {
+            let guard = self.ivars().state.borrow();
+            let Some(state) = guard.as_ref() else { return };
+            if state.settings_window.is_none() {
+                return;
+            }
+        }
+        let picked = rfd::FileDialog::new()
+            .add_filter("KeePass database", &["kdbx"])
+            .set_title("Choose a KeePass database")
+            .pick_file();
+        let Some(path) = picked else { return };
+
+        let guard = self.ivars().state.borrow();
+        if let Some(state) = guard.as_ref()
+            && let Some(window) = &state.settings_window
+        {
+            window.set_db_path(&path.to_string_lossy());
+        }
+    }
 }
 
 fn open_popup(state: &mut AppState, target: Option<Target>) {
@@ -514,13 +697,29 @@ fn open_popup(state: &mut AppState, target: Option<Target>) {
         (None, _) => PopupContent::fresh_prompt(),
     };
     show_popup(state);
+    // `cached_entries` is a display buffer now, not the source of truth
+    // (plan requirement #6) — re-enumerate on every open so a KeePass
+    // database edited externally (or a Bitwarden item changed via another
+    // client) doesn't show stale data just because this session already
+    // had a list cached. For KeePass this is free (the resident unlocked
+    // vault, no I/O); for Bitwarden it's `bw list items` against the
+    // retained session, no `bw sync`. At worst one tick stale — the
+    // already-cached list shows immediately, `List`'s reply updates it a
+    // moment later.
+    if state.vault_state == VaultState::Unlocked {
+        state.vault.send(VaultCmd::List);
+    }
 }
 
 fn show_popup(state: &mut AppState) {
+    // Refreshed here, not just left at whatever `on_tick` last polled, so
+    // opening the popup while already holding Shift/Option shows the right
+    // icon immediately rather than up to one tick (~16ms) late.
+    poll_modifier_kind(state);
     let (w, h) = state.panel.layout(
         &state.popup_content,
         &row_labels(state),
-        dropped_count(state),
+        state.last_modifier_kind,
         hidden_by_cap_count(state),
         stale_text(state).as_deref(),
         blocked_text(state).as_deref(),
@@ -550,9 +749,18 @@ fn show_popup(state: &mut AppState) {
     // documented to be able to defer taking effect; the deprecated call
     // is synchronous, which `makeFirstResponder` immediately afterward
     // depends on.
+    //
+    // Activation runs *before* `panel.raise()`, not after — found in
+    // manual testing to be the cause of the popup occasionally opening
+    // behind another app's window: ordering the panel front while this
+    // process is still inactive doesn't reliably raise it above other
+    // applications' windows (see `Panel::raise`'s doc). Activating first
+    // gives the OS a chance to actually hand this process the foreground
+    // before anything asks to be raised into it.
     let mtm = MainThreadMarker::new().expect("show_popup must run on the main thread");
     #[allow(deprecated)]
     NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    state.panel.raise();
     match &state.popup_content {
         PopupContent::Prompting { .. } => state.panel.focus_prompt(),
         _ => state.panel.focus_list_catcher(),
@@ -608,7 +816,10 @@ fn handle_lock(state: &mut AppState) {
     }
     state.popup_content = PopupContent::Locking;
     set_vault_state(state, VaultState::Locking);
-    let _ = state.bw_cmd_tx.send(BwCmd::Lock);
+    if state.popup_visible {
+        show_popup(state);
+    }
+    state.vault.send(VaultCmd::Lock);
 }
 
 fn handle_sync(state: &mut AppState) {
@@ -618,8 +829,11 @@ fn handle_sync(state: &mut AppState) {
     eprintln!("sync: refreshing cached items");
     if !state.popup_visible || matches!(state.popup_content, PopupContent::ShowingList { .. }) {
         state.popup_content = PopupContent::Syncing;
+        if state.popup_visible {
+            show_popup(state);
+        }
     }
-    let _ = state.bw_cmd_tx.send(BwCmd::Sync);
+    state.vault.send(VaultCmd::Sync);
 }
 
 fn set_vault_state(state: &mut AppState, new: VaultState) {
@@ -628,9 +842,35 @@ fn set_vault_state(state: &mut AppState, new: VaultState) {
     state.tray.set_unlocked_items_visible(new == VaultState::Unlocked);
 }
 
-fn handle_bw_result(state: &mut AppState, result: BwResult) {
+/// Called right after `state.vault.respawn(..)` — the old worker's secrets
+/// are already gone the moment its `Sender` is replaced (see `VaultHandle::
+/// respawn`'s doc), so unlike `handle_lock` this snaps straight to
+/// `Locked`/a fresh prompt rather than sending a command and waiting for a
+/// reply. Deliberately does **not** send `VaultCmd::Lock` to the old worker
+/// first — that would be redundant (dropping the sender already destroys
+/// its secrets) and, per `Config::lock_on_exit`'s own existing rationale, a
+/// provider switch isn't an implicit "log out of Bitwarden everywhere"
+/// request.
+fn reset_for_provider_switch(state: &mut AppState) {
+    eprintln!("settings: vault provider switched — clearing cached items and locking");
+    state.cached_entries = None;
+    state.sync_stale = None;
+    state.delivery = None;
+    hide_indicator(state);
+    if state.hotkey_suspended {
+        state.hotkey.resume();
+        state.hotkey_suspended = false;
+    }
+    set_vault_state(state, VaultState::Locked);
+    state.popup_content = PopupContent::fresh_prompt();
+    if state.popup_visible {
+        show_popup(state);
+    }
+}
+
+fn handle_vault_result(state: &mut AppState, result: VaultResult) {
     match result {
-        BwResult::Items { entries, dropped, stale } => {
+        VaultResult::Items { entries, dropped, stale } => {
             if state.vault_state == VaultState::Locking {
                 if state.cfg.debug_log {
                     eprintln!("bw: dropping stale sync result — a lock is in flight");
@@ -645,7 +885,7 @@ fn handle_bw_result(state: &mut AppState, result: BwResult) {
                 if let Some(notice) = &stale {
                     eprintln!(
                         "bw: sync did not succeed ({}): {} — showing the cached list anyway",
-                        notice.reason.summary(),
+                        notice.reason.summary(state.vault.provider()),
                         notice.detail
                     );
                 }
@@ -653,14 +893,28 @@ fn handle_bw_result(state: &mut AppState, result: BwResult) {
             state.cached_entries = Some((entries, dropped));
             state.sync_stale = stale;
             set_vault_state(state, VaultState::Unlocked);
-            if matches!(state.popup_content, PopupContent::Unlocking | PopupContent::Syncing) {
-                state.popup_content = PopupContent::ShowingList { selected: 0, message: None };
+            // Also refreshes an *already-shown* list — not just the
+            // Unlocking/Syncing transitions — since `VaultCmd::List` (sent
+            // on every popup open, see `open_popup`) can now deliver an
+            // `Items` result while the popup is already sitting on
+            // `ShowingList` from a still-fresh previous fetch. Preserves
+            // the current selection rather than resetting it to 0, since
+            // this is a background refresh, not a new list appearing.
+            if let PopupContent::Unlocking | PopupContent::Syncing | PopupContent::ShowingList { .. } =
+                state.popup_content
+            {
+                let selected = if let PopupContent::ShowingList { selected, .. } = state.popup_content {
+                    selected
+                } else {
+                    0
+                };
+                state.popup_content = PopupContent::ShowingList { selected, message: None };
                 if state.popup_visible {
                     show_popup(state);
                 }
             }
         }
-        BwResult::Failed { stage, kind, message } => {
+        VaultResult::Failed { stage, kind, message } => {
             eprintln!("bw: failed at {stage}: {message}");
             if stage == "sync" {
                 state.sync_stale = Some(StaleNotice { reason: kind, last_sync: None, detail: message.clone() });
@@ -668,6 +922,9 @@ fn handle_bw_result(state: &mut AppState, result: BwResult) {
             match &state.popup_content {
                 PopupContent::Unlocking => {
                     state.popup_content = PopupContent::Prompting { error: Some(message) };
+                    if state.popup_visible {
+                        show_popup(state);
+                    }
                 }
                 PopupContent::Syncing => {
                     state.popup_content = if state.cached_entries.is_some() {
@@ -683,20 +940,26 @@ fn handle_bw_result(state: &mut AppState, result: BwResult) {
                     let selected = *selected;
                     state.popup_content =
                         PopupContent::ShowingList { selected, message: Some(format!("{stage}: {message}")) };
+                    if state.popup_visible {
+                        show_popup(state);
+                    }
                 }
                 _ => {}
             }
         }
-        BwResult::Locked => {
+        VaultResult::Locked => {
             if state.cfg.debug_log {
                 eprintln!("bw: lock finished");
             }
             set_vault_state(state, VaultState::Locked);
             if matches!(state.popup_content, PopupContent::Locking) {
                 state.popup_content = PopupContent::fresh_prompt();
+                if state.popup_visible {
+                    show_popup(state);
+                }
             }
         }
-        BwResult::Totp(code) => {
+        VaultResult::Totp(code) => {
             let PopupContent::FetchingOtp { selected } = state.popup_content else { return };
             let Some(target) = state.popup_target else {
                 state.popup_content = PopupContent::ShowingList { selected, message: Some("no delivery target".to_string()) };
@@ -740,7 +1003,10 @@ fn start_delivery(state: &mut AppState, selected: usize, kind: DeliveryKind) {
             }
             let item_id = entry.id.clone();
             state.popup_content = PopupContent::FetchingOtp { selected };
-            let _ = state.bw_cmd_tx.send(BwCmd::GetTotp(item_id));
+            if state.popup_visible {
+                show_popup(state);
+            }
+            state.vault.send(VaultCmd::GetTotp(item_id));
         }
     }
 }
@@ -860,33 +1126,73 @@ fn refresh_list(state: &mut AppState) {
     let (w, h) = state.panel.layout(
         &state.popup_content,
         &row_labels(state),
-        dropped_count(state),
+        state.last_modifier_kind,
         hidden_by_cap_count(state),
         stale_text(state).as_deref(),
         blocked_text(state).as_deref(),
     );
-    let _ = (w, h); // size is fixed once shown; layout() still needs to run to update control content/visibility
+    state.panel.resize_keeping_top_left(w, h);
 }
 
+/// Reads the currently held Shift/Option state and updates
+/// `state.last_modifier_kind`; returns whether it actually changed, so
+/// callers only re-render when something would visibly differ. Polled
+/// (`NSEvent::modifierFlags_class()` — current global state, no captured
+/// event needed) rather than pushed by an event, since there is no local
+/// `NSEvent` monitor here (that needs the `block2` crate, not currently a
+/// dependency — see `settings.rs`'s module doc for the same tradeoff noted
+/// for the hotkey recorder) and this app already polls everything else on
+/// `on_tick`'s ~16ms timer.
+fn poll_modifier_kind(state: &mut AppState) -> bool {
+    let flags = NSEvent::modifierFlags_class();
+    let kind = DeliveryKind::from_flags(
+        flags.contains(NSEventModifierFlags::Shift),
+        flags.contains(NSEventModifierFlags::Option),
+    );
+    if kind == state.last_modifier_kind {
+        false
+    } else {
+        state.last_modifier_kind = kind;
+        true
+    }
+}
+
+/// macOS virtual keycodes for the physical digit keys — top row and
+/// numpad — mapped to the row index they select (`'1'` → 0, …, `'9'` → 8,
+/// `'0'` → 9, matching `RowBadge`'s slot-to-digit convention in
+/// `panel.rs`). These are fixed hardware scan codes (`kVK_ANSI_1`… /
+/// `kVK_ANSI_Keypad1`… in Carbon's `HIToolbox/Events.h`), the same
+/// physical key regardless of keyboard layout or held modifiers — see
+/// `AppDelegate::handle_text_change` for why that matters.
+fn digit_from_keycode(code: u16) -> Option<usize> {
+    match code {
+        18 | 83 => Some(0), // 1
+        19 | 84 => Some(1), // 2
+        20 | 85 => Some(2), // 3
+        21 | 86 => Some(3), // 4
+        23 | 87 => Some(4), // 5
+        22 | 88 => Some(5), // 6
+        26 | 89 => Some(6), // 7
+        28 | 91 => Some(7), // 8
+        25 | 92 => Some(8), // 9
+        29 | 82 => Some(9), // 0
+        _ => None,
+    }
+}
+
+/// The digit badge (`Panel`'s `RowBadge` views) now carries the 1-9/0
+/// indicator, so this is just the entry's own text.
 fn row_labels(state: &AppState) -> Vec<String> {
     let Some((entries, _)) = &state.cached_entries else { return Vec::new() };
     let max = state.cfg.effective_max_visible().min(super::panel::MAX_ROWS);
     entries
         .iter()
         .take(max)
-        .enumerate()
-        .map(|(i, e)| {
-            let badge = if i == 9 { '0' } else { char::from(b'1' + i as u8) };
-            match &e.username {
-                Some(u) => format!("{badge}. {} ({u})", e.name),
-                None => format!("{badge}. {}", e.name),
-            }
+        .map(|e| match &e.username {
+            Some(u) => format!("{} ({u})", e.name),
+            None => e.name.clone(),
         })
         .collect()
-}
-
-fn dropped_count(state: &AppState) -> usize {
-    state.cached_entries.as_ref().map_or(0, |(_, d)| *d)
 }
 
 fn hidden_by_cap_count(state: &AppState) -> usize {
@@ -925,7 +1231,34 @@ fn blocked_text(state: &AppState) -> Option<String> {
 }
 
 fn apply_settings(state: &mut AppState, draft: &settings::Draft) -> Result<(), String> {
+    // Validated first, and refuses the whole save on failure (rather than
+    // applying the other fields and only complaining about this one) —
+    // there's no such thing as a partially-valid provider selection.
+    if draft.provider == Provider::KeePass {
+        let path = draft.keepass_path.trim();
+        if path.is_empty() {
+            return Err("No KeePass database selected — pick one in Settings.".to_string());
+        }
+        if !std::path::Path::new(path).is_file() {
+            return Err(format!("KeePass database not found: {path}"));
+        }
+    }
+
     let mut error = None;
+
+    // Deliberately inert as of this phase: changing the provider or the
+    // KeePass path here persists to `state.cfg` but does not yet respawn
+    // the vault worker (that's `vault::VaultHandle`, Phase 4) — the app
+    // still unconditionally runs the `bw` backend until then.
+    if draft.provider != state.cfg.provider {
+        eprintln!("settings: vault provider changed to {:?}", draft.provider);
+        state.cfg.provider = draft.provider;
+    }
+    let trimmed_keepass_path = draft.keepass_path.trim();
+    if trimmed_keepass_path != state.cfg.keepass_path {
+        eprintln!("settings: KeePass database path changed");
+        state.cfg.keepass_path = trimmed_keepass_path.to_string();
+    }
 
     if draft.hotkey_spec != state.cfg.hotkey {
         match state.hotkey.set(&draft.hotkey_spec) {
@@ -937,7 +1270,14 @@ fn apply_settings(state: &mut AppState, draft: &settings::Draft) -> Result<(), S
         }
     }
 
-    if draft.autostart != state.cfg.autostart {
+    // Compared against the *live* SMAppService status, not `state.cfg.autostart`
+    // — the config value and reality can diverge (e.g. `RequiresApproval`
+    // pending in System Settings), and diffing against a stale config value
+    // was exactly what made Save call `unregisterAndReturnError()` on a
+    // service that was never actually registered. Skipped entirely when the
+    // checkbox is disabled (unbundled dev binary — see `settings::show`),
+    // since `draft.autostart` is meaningless there.
+    if platform::autostart::is_available() && draft.autostart != platform::autostart::is_enabled() {
         match platform::autostart::set_enabled(draft.autostart) {
             Ok(()) => {
                 eprintln!("settings: autostart {}", if draft.autostart { "enabled" } else { "disabled" });
@@ -966,8 +1306,16 @@ fn apply_settings(state: &mut AppState, draft: &settings::Draft) -> Result<(), S
         state.cfg.max_visible_items = clamped;
     }
 
-    if let Err(e) = state.cfg.save() {
-        error.get_or_insert(format!("saving config: {e}"));
+    match state.cfg.save() {
+        Ok(()) => {
+            if state.vault.needs_respawn(&state.cfg) {
+                state.vault.respawn(&state.cfg);
+                reset_for_provider_switch(state);
+            }
+        }
+        Err(e) => {
+            error.get_or_insert(format!("saving config: {e}"));
+        }
     }
 
     error.map_or(Ok(()), Err)

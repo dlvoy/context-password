@@ -6,9 +6,9 @@
 use eframe::egui;
 use egui::emath::GuiRounding;
 
-use crate::bw::model::Entry;
 use crate::msg::StaleNotice;
 use crate::platform::BlockReason;
+use crate::vault::Entry;
 
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xcc, 0x88, 0x00);
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xcc, 0x33, 0x33);

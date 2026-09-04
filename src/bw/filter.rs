@@ -6,120 +6,10 @@
 //! app's own prefix, then its optional `?os=` list against this build's
 //! [`platform::OS_TAG`](crate::platform::OS_TAG) — happens here.
 
-use super::model::{Entry, RawItem};
-use crate::platform::OS_TAGS;
+use super::model::RawItem;
 use crate::secret::Secret;
-
-/// What one `<prefix>/<ORD>[?os=...]` tag uri means for *this* build.
-enum Verdict {
-    /// Ours and meant for this build (no `os=` filter, or one that lists
-    /// this build's tag). Inner `None` = the ORD segment is missing or
-    /// unparseable — kept and sorted last, exactly as before `?os=`
-    /// existed.
-    Show(Option<i64>),
-    /// Ours, but its `os=` list names only other systems. Deliberate, so
-    /// the item is hidden *without* counting toward `dropped` — otherwise
-    /// a cross-platform vault would show a permanent "N item(s) hidden"
-    /// for entries that are working exactly as intended.
-    OtherOs,
-    /// Ours, but `os=` held no token this build recognises at all (e.g. a
-    /// typo like `?os=beos`, or an empty value). Hidden and counted, like
-    /// any other malformed item.
-    BadOs,
-}
-
-/// One resolved tag uri.
-struct Tag {
-    verdict: Verdict,
-    /// Set when the uri's `os=` value carried at least one token outside
-    /// [`OS_TAGS`] — even when another token in the same list still
-    /// matched (`?os=win,xx`) or the whole thing is [`Verdict::BadOs`].
-    /// Logged in `build_entries` so a typo is visible, independent of
-    /// whether it changed whether the item shows.
-    unknown_os: Option<String>,
-}
-
-fn verdict_priority(v: &Verdict) -> u8 {
-    match v {
-        Verdict::Show(_) => 2,
-        Verdict::BadOs => 1,
-        Verdict::OtherOs => 0,
-    }
-}
-
-/// Parses the bit after `?` on a single tag uri against this build's `os`
-/// token. `query` is empty when the uri had no `?` at all.
-fn classify(ord: Option<i64>, query: &str, os: &str) -> Tag {
-    if query.is_empty() {
-        return Tag {
-            verdict: Verdict::Show(ord),
-            unknown_os: None,
-        };
-    }
-
-    let mut saw_os_pair = false;
-    let mut recognized_any = false;
-    let mut matched = false;
-    let mut unknown: Vec<String> = Vec::new();
-    let mut raw_values: Vec<String> = Vec::new();
-
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        // No `=` (e.g. a bare `?os`) is treated as an empty value, not
-        // skipped — `?os` alone is exactly as malformed as `?os=`.
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if !key.trim().eq_ignore_ascii_case("os") {
-            // Unknown parameters are ignored, not errors.
-            continue;
-        }
-        saw_os_pair = true;
-        raw_values.push(value.trim().to_string());
-        for token in value.split(',') {
-            let token = token.trim().to_lowercase();
-            if token.is_empty() {
-                continue;
-            }
-            if OS_TAGS.contains(&token.as_str()) {
-                recognized_any = true;
-                if token == os {
-                    matched = true;
-                }
-            } else {
-                unknown.push(token);
-            }
-        }
-    }
-
-    if !saw_os_pair {
-        // A query string with no `os` pair at all (e.g. `?foo=bar`).
-        return Tag {
-            verdict: Verdict::Show(ord),
-            unknown_os: None,
-        };
-    }
-
-    let verdict = if !recognized_any {
-        Verdict::BadOs
-    } else if matched {
-        Verdict::Show(ord)
-    } else {
-        Verdict::OtherOs
-    };
-
-    let unknown_os = if !unknown.is_empty() {
-        Some(unknown.join(","))
-    } else if !recognized_any {
-        // Every `os=` pair was present but empty (`?os=` or `?os`) — still
-        // worth logging so the typo shows the (blank) value it had.
-        Some(raw_values.join(","))
-    } else {
-        None
-    };
-
-    Tag { verdict, unknown_os }
-}
+use crate::vault::tag::{self, Tag, Verdict};
+use crate::vault::{sort_entries, Entry};
 
 /// Returns the resolved tag for `item`, or `None` if none of its uris
 /// belong to this app at all (wrong prefix, or a mere substring collision
@@ -130,41 +20,18 @@ fn classify(ord: Option<i64>, query: &str, os: &str) -> Tag {
 /// `app://context-password/5?os=mac`, giving it a different ORD per
 /// platform. When more than one tag uri is present, the first
 /// [`Verdict::Show`] wins; failing that, the first [`Verdict::BadOs`];
-/// failing that, [`Verdict::OtherOs`]. This is deliberate priority, not an
-/// arbitrary pick: a uri meant for this build always wins over one that
-/// isn't, and a malformed filter is surfaced over one that's merely for
-/// another OS.
+/// failing that, [`Verdict::OtherOs`]. This is deliberate priority (see
+/// `vault::tag::best`), not an arbitrary pick: a uri meant for this build
+/// always wins over one that isn't, and a malformed filter is surfaced over
+/// one that's merely for another OS.
 fn tag_of(item: &RawItem, prefix: &str, os: &str) -> Option<Tag> {
     let login = item.login.as_ref()?;
     let mut best: Option<Tag> = None;
-
     for uri in &login.uris {
-        let trimmed = uri.uri.trim();
-        let Some(rest) = trimmed.strip_prefix(prefix) else {
-            continue;
-        };
-        // Reject a uri that merely starts with the prefix as a substring —
-        // e.g. "app://context-password-other/1" — by requiring the next
-        // character to be the path separator, or nothing at all.
-        if !rest.is_empty() && !rest.starts_with('/') {
-            continue;
+        if let Some(t) = tag::from_uri(&uri.uri, prefix, os) {
+            best = tag::best(best, t);
         }
-        let rest = rest.trim_start_matches('/');
-        let (ord_part, query) = rest.split_once('?').unwrap_or((rest, ""));
-        let ord_str = ord_part.trim();
-        let ord = if ord_str.is_empty() {
-            None
-        } else {
-            ord_str.parse::<i64>().ok()
-        };
-
-        let tag = classify(ord, query, os);
-        best = match best {
-            Some(b) if verdict_priority(&b.verdict) >= verdict_priority(&tag.verdict) => Some(b),
-            _ => Some(tag),
-        };
     }
-
     best
 }
 
@@ -232,16 +99,7 @@ pub fn build_entries(items: Vec<RawItem>, prefix: &str, os: &str) -> (Vec<Entry>
         });
     }
 
-    // Malformed/missing ORDs sort last, not as 0 — sorting them as 0 would
-    // silently promote a typo to the top and shuffle every deliberately
-    // ordered entry (plan §6).
-    entries.sort_by(|a, b| {
-        (a.ord.is_none(), a.ord.unwrap_or(0), a.name.to_lowercase()).cmp(&(
-            b.ord.is_none(),
-            b.ord.unwrap_or(0),
-            b.name.to_lowercase(),
-        ))
-    });
+    sort_entries(&mut entries);
 
     (entries, dropped)
 }
@@ -250,6 +108,7 @@ pub fn build_entries(items: Vec<RawItem>, prefix: &str, os: &str) -> (Vec<Entry>
 mod tests {
     use super::*;
     use crate::bw::model::{RawLogin, RawUri};
+    use crate::platform::OS_TAGS;
 
     const PREFIX: &str = "app://context-password";
     /// The OS token these tests drive `build_entries` with by default —

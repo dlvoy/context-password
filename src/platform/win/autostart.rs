@@ -18,6 +18,14 @@ use windows_sys::Win32::System::Registry::{
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const VALUE_NAME: &str = "context-password";
 
+/// Always available on Windows — any executable can add itself to the Run
+/// key, unlike macOS's `SMAppService`, which needs a real `.app` bundle.
+/// Exists so `mac_ui::settings` can gate the checkbox through one
+/// `platform::autostart::is_available()` call on either target.
+pub fn is_available() -> bool {
+    true
+}
+
 fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }

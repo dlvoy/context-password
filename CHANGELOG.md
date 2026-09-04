@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-04
+
+### Added
+
+- macOS support: a native AppKit front-end (global hotkey, popup, tray, Settings, About), running
+  alongside the existing Windows build.
+- A KeePass (KDBX) vault provider, selectable alongside Bitwarden in Settings on both platforms —
+  unlocks a local `.kdbx` file directly, no server or CLI required. Entries are tagged the same
+  way as Bitwarden (a URL or a `context-password` custom field), with optional TOTP support via
+  an `otp` custom field.
+
 ## [1.3.0] - 2026-09-02
 
 ### Added

@@ -44,6 +44,8 @@ mod tests {
         let files = [
             ("src/secret.rs", include_str!("secret.rs")),
             ("src/bw/model.rs", include_str!("bw/model.rs")),
+            ("src/vault/entry.rs", include_str!("vault/entry.rs")),
+            ("src/keepass/model.rs", include_str!("keepass/model.rs")),
         ];
         for (path, src) in files {
             // Only the non-test portion — `include_str!` embeds this test's

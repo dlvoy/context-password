@@ -1,4 +1,4 @@
-//! The `bw` worker thread.
+//! The `bw` worker thread — the Bitwarden `VaultCmd`/`VaultResult` backend.
 //!
 //! One long-lived thread plus one `mpsc` channel in, one out (plan §7) — no
 //! async runtime. Every `bw` call is a blocking subprocess call (now with a
@@ -17,79 +17,109 @@ pub mod model;
 pub mod run;
 
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
 
-use error::{classify, BwErrorKind};
+use error::classify;
 
-use crate::msg::{BwCmd, BwResult, Msg, StaleNotice};
+use crate::msg::{Msg, StaleNotice, VaultCmd, VaultResult};
 use crate::secret::Secret;
+use crate::vault::{Provider, VaultErrorKind, Waker};
 
-/// Wakes whatever event loop owns the UI thread after a result has been
-/// pushed onto `results_tx` — `ctx.request_repaint()` on Windows/eframe, a
-/// run-loop signal on macOS/AppKit. Every other event source in this app
-/// (tray, hotkey, the delayed-unlock timer) follows the same "send, then
-/// wake" pattern; this is what lets `bw::spawn` stay UI-toolkit-agnostic.
-pub type Waker = Arc<dyn Fn() + Send + Sync>;
+/// This module always reports as the Bitwarden provider — every
+/// `VaultErrorKind::summary()` call site here is unconditionally in a
+/// Bitwarden context, so there's no live `Config::provider` to thread
+/// through yet (that only exists once a `VaultHandle` picks the active
+/// backend at runtime).
+const THIS_PROVIDER: Provider = Provider::Bitwarden;
 
 /// Spawns the worker thread and returns a channel to send it commands.
 /// Results are pushed back through `results_tx` — the app's shared `Msg`
-/// channel — followed by a call to `wake`.
+/// channel — followed by a call to `wake`. `generation` is stamped onto
+/// every `Msg::Vault` this worker ever sends; see `Msg::Vault`'s doc.
 pub fn spawn(
     bw_path: String,
     uri_prefix: String,
+    generation: u64,
     results_tx: Sender<Msg>,
     wake: Waker,
-) -> Sender<BwCmd> {
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BwCmd>();
-    std::thread::spawn(move || worker_loop(&bw_path, &uri_prefix, &cmd_rx, &results_tx, &wake));
+) -> Sender<VaultCmd> {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<VaultCmd>();
+    std::thread::spawn(move || {
+        worker_loop(&bw_path, &uri_prefix, generation, &cmd_rx, &results_tx, &wake);
+    });
     cmd_tx
 }
 
 fn worker_loop(
     bw_path: &str,
     uri_prefix: &str,
-    cmd_rx: &Receiver<BwCmd>,
+    generation: u64,
+    cmd_rx: &Receiver<VaultCmd>,
     results_tx: &Sender<Msg>,
     wake: &Waker,
 ) {
     // Blocks at zero CPU between commands; never crosses back to the UI.
     let mut session: Option<Secret> = None;
+    let send = |result: VaultResult| {
+        let _ = results_tx.send(Msg::Vault { generation, result });
+    };
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            BwCmd::Unlock(master_password) => {
+            VaultCmd::Unlock(master_password) => {
                 let result =
                     unlock_sync_list(bw_path, uri_prefix, &master_password, &mut session);
-                let _ = results_tx.send(Msg::Bw(result));
+                send(result);
                 wake();
             }
-            BwCmd::Sync => {
+            VaultCmd::Sync => {
                 let result = match &session {
-                    None => BwResult::Failed {
+                    None => VaultResult::Failed {
                         stage: "sync",
-                        kind: BwErrorKind::Locked,
+                        kind: VaultErrorKind::Locked,
                         message: "vault is locked".to_string(),
                     },
                     Some(key) => match exe::resolve(bw_path) {
-                        Err(message) => BwResult::Failed {
+                        Err(message) => VaultResult::Failed {
                             stage: "resolve",
-                            kind: BwErrorKind::NotFound,
+                            kind: VaultErrorKind::NotFound,
                             message,
                         },
                         Ok(exe) => sync_then_list(&exe, uri_prefix, key),
                     },
                 };
-                let _ = results_tx.send(Msg::Bw(result));
+                send(result);
                 wake();
             }
-            BwCmd::Lock => {
+            VaultCmd::List => {
+                // No network round-trip, no `bw sync` — just `bw list
+                // items` against the retained session. The popup-open/
+                // refresh path; `Sync` above is the explicit tray action.
+                let result = match &session {
+                    None => VaultResult::Failed {
+                        stage: "list",
+                        kind: VaultErrorKind::Locked,
+                        message: "vault is locked".to_string(),
+                    },
+                    Some(key) => match exe::resolve(bw_path) {
+                        Err(message) => VaultResult::Failed {
+                            stage: "resolve",
+                            kind: VaultErrorKind::NotFound,
+                            message,
+                        },
+                        Ok(exe) => list_only(&exe, uri_prefix, key, None),
+                    },
+                };
+                send(result);
+                wake();
+            }
+            VaultCmd::Lock => {
                 // Best-effort and silent either way: the worker's own
                 // session field is dropped (and zeroized) regardless of
                 // whether the CLI call itself succeeds — the user's intent
                 // is "we don't have a vault open anymore," not "only if the
                 // CLI agrees." The UI still needs to know it's *done*
                 // though (§2/§7 of the plan both wait on this), hence
-                // `BwResult::Locked` regardless of which branch ran.
+                // `VaultResult::Locked` regardless of which branch ran.
                 match exe::resolve(bw_path).map(|exe| cmd::lock(&exe)) {
                     Ok(Ok(run)) if run.success() => {
                         eprintln!("bw: locked");
@@ -102,35 +132,35 @@ fn worker_loop(
                     Err(e) => eprintln!("bw: failed to resolve executable for lock: {e}"),
                 }
                 session = None;
-                let _ = results_tx.send(Msg::Bw(BwResult::Locked));
+                send(VaultResult::Locked);
                 wake();
             }
-            BwCmd::GetTotp(item_id) => {
+            VaultCmd::GetTotp(item_id) => {
                 let result = get_totp(bw_path, &item_id, &session);
-                let _ = results_tx.send(Msg::Bw(result));
+                send(result);
                 wake();
             }
         }
     }
 }
 
-fn get_totp(bw_path: &str, item_id: &str, session: &Option<Secret>) -> BwResult {
+fn get_totp(bw_path: &str, item_id: &str, session: &Option<Secret>) -> VaultResult {
     let Some(session) = session else {
         // Shouldn't normally be reachable — the item list this id came from
         // only exists after a successful unlock — but handled rather than
         // unwrapped in case a lock races a still-open popup.
-        return BwResult::Failed {
+        return VaultResult::Failed {
             stage: "totp",
-            kind: BwErrorKind::Locked,
+            kind: VaultErrorKind::Locked,
             message: "vault is locked".to_string(),
         };
     };
     let exe = match exe::resolve(bw_path) {
         Ok(exe) => exe,
         Err(message) => {
-            return BwResult::Failed {
+            return VaultResult::Failed {
                 stage: "totp",
-                kind: BwErrorKind::NotFound,
+                kind: VaultErrorKind::NotFound,
                 message,
             };
         }
@@ -138,21 +168,24 @@ fn get_totp(bw_path: &str, item_id: &str, session: &Option<Secret>) -> BwResult 
     let mut run = match cmd::get_totp(&exe, session.expose(), item_id) {
         Ok(r) => r,
         Err(e) => {
-            return BwResult::Failed {
+            return VaultResult::Failed {
                 stage: "totp",
-                kind: BwErrorKind::Other,
+                kind: VaultErrorKind::Other,
                 message: e.to_string(),
             };
         }
     };
     if !run.success() {
         let kind = classify(&run.stderr, run.timed_out);
+        // See `list_only`'s matching comment — never echo raw stderr into
+        // the UI.
         let message = if run.stderr.is_empty() {
             "bw get totp failed (does this item have a TOTP configured?)".to_string()
         } else {
-            run.stderr.clone()
+            eprintln!("bw: get totp failed (kind={kind:?}): {}", run.stderr);
+            format!("bw get totp failed: {}", kind.summary(THIS_PROVIDER))
         };
-        return BwResult::Failed {
+        return VaultResult::Failed {
             stage: "totp",
             kind,
             message,
@@ -163,13 +196,13 @@ fn get_totp(bw_path: &str, item_id: &str, session: &Option<Secret>) -> BwResult 
     // as the unlock/list stdout buffers.
     run.stdout.fill(0);
     if code.is_empty() {
-        return BwResult::Failed {
+        return VaultResult::Failed {
             stage: "totp",
-            kind: BwErrorKind::Other,
+            kind: VaultErrorKind::Other,
             message: "bw get totp returned an empty code".to_string(),
         };
     }
-    BwResult::Totp(Secret::new(code))
+    VaultResult::Totp(Secret::new(code))
 }
 
 fn unlock_sync_list(
@@ -177,37 +210,42 @@ fn unlock_sync_list(
     uri_prefix: &str,
     master_password: &Secret,
     session: &mut Option<Secret>,
-) -> BwResult {
+) -> VaultResult {
     let exe = match exe::resolve(bw_path) {
         Ok(exe) => exe,
         Err(message) => {
-            return BwResult::Failed {
+            return VaultResult::Failed {
                 stage: "resolve",
-                kind: BwErrorKind::NotFound,
+                kind: VaultErrorKind::NotFound,
                 message,
             };
         }
     };
 
-    let mut unlock_run = match cmd::unlock(&exe, master_password.expose()) {
+    let (mut unlock_run, tls_fallback_used) = match cmd::unlock(&exe, master_password.expose()) {
         Ok(r) => r,
         Err(e) => {
-            return BwResult::Failed {
+            return VaultResult::Failed {
                 stage: "unlock",
-                kind: BwErrorKind::Other,
+                kind: VaultErrorKind::Other,
                 message: e.to_string(),
             };
         }
     };
     if !unlock_run.success() {
         let kind = classify(&unlock_run.stderr, unlock_run.timed_out);
-        // `bw unlock` derives the key from the locally-cached vault and
-        // never touches the network — so a `Network` classification here
-        // means the stderr text was misread, not that unlocking genuinely
-        // needs connectivity. Fall back to a status probe for a message
-        // that actually matches what's wrong.
+        // Measured on this machine: contrary to what was assumed before
+        // real-vault testing, `bw unlock` is *not* purely local — it fetches
+        // ServerConfig (feature flags) from the server before deriving the
+        // key, and fails outright if that fetch fails (`cmd::unlock` retries
+        // once over an insecure TLS connection first, for the corporate-
+        // proxy case; this is what's left if even that didn't help). A
+        // `Network`/`Tls` classification here is therefore a real,
+        // unlock-blocking condition, not a misread. `precise_unlock_message`
+        // still probes `status` (which stays local-only) for a sharper
+        // message when possible.
         let message = precise_unlock_message(&exe, kind, &unlock_run.stderr, unlock_run.timed_out);
-        return BwResult::Failed {
+        return VaultResult::Failed {
             stage: "unlock",
             kind,
             message,
@@ -225,14 +263,42 @@ fn unlock_sync_list(
     *session = Some(key);
     let key = session.as_ref().expect("just assigned above");
 
-    sync_then_list(&exe, uri_prefix, key)
+    if tls_fallback_used {
+        // Unlock only got through by disabling certificate verification —
+        // `bw sync` would hit the exact same intercepting host and, unlike
+        // `unlock`, is known to crash rather than fail cleanly there (see
+        // `cmd::sync`'s doc). Skip straight to listing the local cache
+        // instead of wasting a sync attempt already known to fail.
+        eprintln!(
+            "bw: skipping sync — unlock needed the insecure-TLS fallback, so sync would hit the \
+             same blocked host"
+        );
+        list_only(
+            &exe,
+            uri_prefix,
+            key,
+            Some(StaleNotice {
+                reason: VaultErrorKind::Tls,
+                last_sync: probe_last_sync(&exe),
+                detail: "sync skipped — this network can't reach the vault server securely"
+                    .to_string(),
+            }),
+        )
+    } else {
+        sync_then_list(&exe, uri_prefix, key)
+    }
 }
 
 /// A precise message for an unlock failure, using a `bw status` probe
 /// (local-only, so safe to run even when the network is down) rather than
 /// trusting `unlock`'s own stderr alone — see `unlock_sync_list`'s call
 /// site for why that stderr can be misleading.
-fn precise_unlock_message(exe: &exe::BwExe, kind: BwErrorKind, stderr: &str, timed_out: bool) -> String {
+fn precise_unlock_message(
+    exe: &exe::BwExe,
+    kind: VaultErrorKind,
+    stderr: &str,
+    timed_out: bool,
+) -> String {
     if timed_out {
         return "bw unlock timed out — the Bitwarden CLI may be unresponsive.".to_string();
     }
@@ -243,17 +309,30 @@ fn precise_unlock_message(exe: &exe::BwExe, kind: BwErrorKind, stderr: &str, tim
                 .to_string()
         }
         _ => match kind {
-            BwErrorKind::NotLoggedIn => {
+            VaultErrorKind::NotLoggedIn => {
                 "No Bitwarden account is logged in on this machine. Run `bw login` in a \
                  terminal, then try again."
                     .to_string()
             }
-            BwErrorKind::Network => {
+            VaultErrorKind::Network => {
                 "Can't reach the Bitwarden server (network blocked?). Unlocking isn't possible \
                  right now."
                     .to_string()
             }
-            BwErrorKind::BadPassword => "wrong master password".to_string(),
+            VaultErrorKind::Tls => {
+                "Can't reach the Bitwarden server — its certificate doesn't match (corporate \
+                 proxy?), and retrying without certificate verification didn't help either. \
+                 Unlocking isn't possible right now."
+                    .to_string()
+            }
+            VaultErrorKind::BadPassword => "wrong master password".to_string(),
+            VaultErrorKind::CorruptedCache => {
+                "The local Bitwarden vault cache appears corrupted (this is a bw CLI-side data \
+                 problem, not your password). Fix: on a network that can actually reach the \
+                 vault server, run `bw logout` then `bw login` again in a terminal, then try \
+                 unlocking here again."
+                    .to_string()
+            }
             _ if stderr.is_empty() => {
                 "bw unlock failed (wrong password, or the vault isn't logged in)".to_string()
             }
@@ -305,9 +384,9 @@ fn probe_last_sync(exe: &exe::BwExe) -> Option<String> {
 }
 
 /// `bw sync` + `bw list items` + parse + filter — the shared tail of both a
-/// fresh unlock and the tray's Sync item (`BwCmd::Sync`), which reuses the
-/// session the worker already holds instead of unlocking again.
-fn sync_then_list(exe: &exe::BwExe, uri_prefix: &str, key: &Secret) -> BwResult {
+/// fresh unlock and the tray's Sync item (`VaultCmd::Sync`), which reuses
+/// the session the worker already holds instead of unlocking again.
+fn sync_then_list(exe: &exe::BwExe, uri_prefix: &str, key: &Secret) -> VaultResult {
     // A non-zero exit (or a timeout) is only recorded as a `StaleNotice`,
     // not treated as failure: an offline or otherwise failing `bw sync`
     // shouldn't cost the user their (still perfectly usable) local list —
@@ -336,32 +415,49 @@ fn sync_then_list(exe: &exe::BwExe, uri_prefix: &str, key: &Secret) -> BwResult 
             })
         }
         Err(e) => {
-            return BwResult::Failed {
+            return VaultResult::Failed {
                 stage: "sync",
-                kind: BwErrorKind::Other,
+                kind: VaultErrorKind::Other,
                 message: e.to_string(),
             };
         }
     };
 
+    list_only(exe, uri_prefix, key, stale)
+}
+
+/// `bw list items` + parse + filter, with the caller supplying whatever
+/// `stale` notice (if any) applies — either from a `sync` that just failed
+/// (`sync_then_list`) or from skipping `sync` entirely (`unlock_sync_list`'s
+/// TLS-fallback case, or `VaultCmd::List`'s no-sync path, see their docs).
+fn list_only(
+    exe: &exe::BwExe,
+    uri_prefix: &str,
+    key: &Secret,
+    stale: Option<StaleNotice>,
+) -> VaultResult {
     let list_run = match cmd::list_items(exe, key.expose(), uri_prefix) {
         Ok(r) => r,
         Err(e) => {
-            return BwResult::Failed {
+            return VaultResult::Failed {
                 stage: "list",
-                kind: BwErrorKind::Other,
+                kind: VaultErrorKind::Other,
                 message: e.to_string(),
             };
         }
     };
     if !list_run.success() {
         let kind = classify(&list_run.stderr, list_run.timed_out);
-        let message = if list_run.stderr.is_empty() {
-            "bw list items failed".to_string()
-        } else {
-            list_run.stderr
-        };
-        return BwResult::Failed {
+        // Never echo raw stderr into the UI (module doc, `VaultErrorKind::
+        // summary`'s doc) — it can be a full Node stack trace (the
+        // `CorruptedCache` case is dozens of `bitwarden_crypto` lines plus a
+        // crash trace) and can leak the vault's server URL. The real text
+        // still reaches the terminal for diagnosis.
+        if !list_run.stderr.is_empty() {
+            eprintln!("bw: list items failed (kind={kind:?}): {}", list_run.stderr);
+        }
+        let message = format!("bw list items failed: {}", kind.summary(THIS_PROVIDER));
+        return VaultResult::Failed {
             stage: "list",
             kind,
             message,
@@ -371,9 +467,9 @@ fn sync_then_list(exe: &exe::BwExe, uri_prefix: &str, key: &Secret) -> BwResult 
     let raw_items: Vec<model::RawItem> = match serde_json::from_slice(&list_run.stdout) {
         Ok(items) => items,
         Err(e) => {
-            return BwResult::Failed {
+            return VaultResult::Failed {
                 stage: "parse",
-                kind: BwErrorKind::Other,
+                kind: VaultErrorKind::Other,
                 message: e.to_string(),
             };
         }
@@ -385,7 +481,7 @@ fn sync_then_list(exe: &exe::BwExe, uri_prefix: &str, key: &Secret) -> BwResult 
     let (entries, dropped) =
         filter::build_entries(raw_items, uri_prefix, crate::platform::OS_TAG);
 
-    BwResult::Items {
+    VaultResult::Items {
         entries,
         dropped,
         stale,
@@ -442,20 +538,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
 
         match result {
-            BwResult::Failed { stage, kind, message } => {
+            VaultResult::Failed { stage, kind, message } => {
                 assert_eq!(stage, "unlock");
                 // Unauthenticated (never logged in) beats "network" here —
                 // `bw` refuses before ever touching the server, and that's
                 // exactly the more-specific, more-useful message.
-                assert_eq!(kind, BwErrorKind::NotLoggedIn, "message was: {message}");
+                assert_eq!(kind, VaultErrorKind::NotLoggedIn, "message was: {message}");
                 assert!(
                     message.contains("bw login"),
                     "message should point at the fix, got: {message}"
                 );
             }
-            BwResult::Items { .. } => panic!("expected Failed{{stage: \"unlock\", ..}}, got Items"),
-            BwResult::Locked => panic!("expected Failed{{stage: \"unlock\", ..}}, got Locked"),
-            BwResult::Totp(_) => panic!("expected Failed{{stage: \"unlock\", ..}}, got Totp"),
+            VaultResult::Items { .. } => {
+                panic!("expected Failed{{stage: \"unlock\", ..}}, got Items")
+            }
+            VaultResult::Locked => panic!("expected Failed{{stage: \"unlock\", ..}}, got Locked"),
+            VaultResult::Totp(_) => panic!("expected Failed{{stage: \"unlock\", ..}}, got Totp"),
         }
     }
 }

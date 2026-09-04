@@ -1,13 +1,11 @@
-//! Deserialization of `bw list items` output, and the in-memory cache entry
-//! it becomes.
+//! Deserialization of `bw list items` output — the raw JSON shape only.
+//! The provider-agnostic `Entry` type these raw items become lives in
+//! `vault::entry`, shared with the `keepass` backend.
 //!
 //! No `Debug` derive anywhere in this file (plan §8) — a stray `dbg!` on an
-//! item is the realistic way a vault leaks into a log. `Entry::log_line`
-//! below is the one sanctioned way to describe an entry in a log message.
+//! item is the realistic way a vault leaks into a log.
 
 use serde::Deserialize;
-
-use crate::secret::Secret;
 
 #[derive(Deserialize)]
 pub struct RawItem {
@@ -44,34 +42,4 @@ pub struct RawUri {
     #[serde(default, rename = "match")]
     #[allow(dead_code)]
     pub match_type: Option<u8>,
-}
-
-/// One entry in the in-memory popup cache.
-pub struct Entry {
-    pub id: String,
-    pub name: String,
-    pub username: Option<String>,
-    /// `None` when the item's `app://.../ORD` uri is present but the
-    /// trailing segment is missing or unparseable — see
-    /// `bw::filter::ord_of`. Such entries still show up in the popup
-    /// (sorted last), rather than vanishing, so a typo is visible and
-    /// self-correcting.
-    pub ord: Option<i64>,
-    pub password: Secret,
-    /// Whether the item has a TOTP seed configured — checked before ever
-    /// attempting `bw get totp`, so asking for a code on an item that
-    /// doesn't have one is an immediate inline error, not a doomed
-    /// subprocess call.
-    pub has_totp: bool,
-}
-
-impl Entry {
-    /// A redacted line for logging — never the password, and this is the
-    /// only place item data should reach stderr.
-    pub fn log_line(&self) -> String {
-        match self.ord {
-            Some(ord) => format!("{ord}: {}", self.name),
-            None => format!("?: {} (missing/invalid ORD)", self.name),
-        }
-    }
 }

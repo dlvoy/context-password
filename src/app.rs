@@ -36,25 +36,25 @@
 //! lock-on-exit with a timeout (`ExitState`).
 
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use zeroize::Zeroizing;
 
-use crate::bw::model::Entry;
 use crate::config::{Config, UnlockMode};
 use crate::controller::{
     self, Content, Delivery, DeliveryKind, DeliveryPhase, ExitState, IndicatorPhase, VaultState,
 };
 use crate::hotkey::Hotkey;
-use crate::msg::{BwCmd, BwResult, Msg, StaleNotice, TrayCmd};
+use crate::msg::{Msg, StaleNotice, TrayCmd, VaultCmd, VaultResult};
 use crate::secret::Secret;
 use crate::ui::config_window;
 use crate::ui::config_window::ConfigWindowState;
 use crate::platform;
 use crate::platform::focus::{self, ActivationResult, Target};
-use crate::{bw, tray};
+use crate::vault::{Entry, Provider, VaultHandle};
+use crate::tray;
 
 const MODIFIER_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const FOREGROUND_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -66,11 +66,16 @@ const FOREGROUND_VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
 /// cadence — total delivery latency is a few hundred ms, not a few ms.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const POPUP_SIZE: (i32, i32) = (340, 220);
-// Hand-tuned to comfortably fit every row (hotkey recorder, three
-// checkboxes, the max-visible-items stepper, and the footer) at the
-// dialog's scaled-up font size (`config_window::FONT_SCALE`) with no
-// clipping or crowding.
-const SETTINGS_SIZE: (i32, i32) = (460, 420);
+// Hand-tuned to comfortably fit every row (the vault dropdown, the
+// conditional KeePass database row, the hotkey recorder, three checkboxes,
+// the max-visible-items stepper, and the footer) at the dialog's scaled-up
+// font size (`config_window::FONT_SCALE`) with no clipping or crowding.
+// Sized for the taller KeePass-selected state so the window doesn't
+// visibly resize under the user when they flip the dropdown — unlike
+// macOS's fixed-frame `settings.rs`, egui's immediate-mode layout would
+// otherwise just reflow, but a resizing *window* mid-interaction still
+// reads as a glitch.
+const SETTINGS_SIZE: (i32, i32) = (460, 480);
 /// Wider than Settings — the license text needs room to stay readable
 /// without wrapping every line down to a couple of words.
 const ABOUT_SIZE: (i32, i32) = (830, 480);
@@ -156,7 +161,7 @@ pub struct App {
     hwnd: windows_sys::Win32::Foundation::HWND,
     cfg: Config,
     rx: Receiver<Msg>,
-    bw_cmd_tx: Sender<BwCmd>,
+    vault: VaultHandle,
     hidden_after_startup: bool,
     popup: PopupState,
     delivery: Option<Delivery>,
@@ -288,9 +293,8 @@ impl App {
         tray.set_unlocked_items_visible(false);
 
         let bw_waker_ctx = cc.egui_ctx.clone();
-        let bw_cmd_tx = bw::spawn(
-            cfg.bw_path.clone(),
-            cfg.uri_prefix.clone(),
+        let vault = VaultHandle::spawn(
+            &cfg,
             tx.clone(),
             std::sync::Arc::new(move || bw_waker_ctx.request_repaint()),
         );
@@ -301,7 +305,7 @@ impl App {
             hwnd,
             cfg,
             rx,
-            bw_cmd_tx,
+            vault,
             hidden_after_startup: false,
             popup: PopupState {
                 phase: ShowPhase::Hidden,
@@ -358,6 +362,18 @@ impl App {
             (None, _) => Content::fresh_prompt(),
         };
         self.popup.phase = ShowPhase::Placing;
+        // `cached_entries` is a display buffer now, not the source of truth
+        // (plan requirement #6) — re-enumerate on every open so a KeePass
+        // database edited externally (or a Bitwarden item changed via
+        // another client) doesn't show stale data just because this
+        // session already had a list cached. For KeePass this is free (the
+        // resident unlocked vault, no I/O); for Bitwarden it's `bw list
+        // items` against the retained session, no `bw sync`. At worst one
+        // tick stale — the already-cached list shows immediately, `List`'s
+        // reply updates it a moment later.
+        if self.vault_state == VaultState::Unlocked {
+            self.vault.send(VaultCmd::List);
+        }
     }
 
     /// Keeps the tray's `Show`/`Unlock` label and `Lock` item's presence in
@@ -368,6 +384,32 @@ impl App {
         self.tray.set_show_label(state == VaultState::Unlocked);
         self.tray
             .set_unlocked_items_visible(state == VaultState::Unlocked);
+    }
+
+    /// Called right after `self.vault.respawn(..)` — the old worker's
+    /// secrets are already gone the moment its `Sender` is replaced (see
+    /// `VaultHandle::respawn`'s doc), so unlike `handle_lock` this snaps
+    /// straight to `Locked`/a fresh prompt rather than sending a command
+    /// and waiting for a reply. Deliberately does **not** send
+    /// `VaultCmd::Lock` to the old worker first — that would be redundant
+    /// (dropping the sender already destroys its secrets) and, per
+    /// `Config::lock_on_exit`'s own existing rationale, a provider switch
+    /// isn't an implicit "log out of Bitwarden everywhere" request. No
+    /// explicit popup redraw needed here (unlike macOS's retained-mode
+    /// `show_popup`) — `ui()` redraws from `self.popup.content` every
+    /// frame regardless of whether the popup is currently visible.
+    fn reset_for_provider_switch(&mut self) {
+        eprintln!("settings: vault provider switched — clearing cached items and locking");
+        self.cached_entries = None;
+        self.sync_stale = None;
+        self.delivery = None;
+        self.hide_indicator();
+        if self.hotkey_suspended {
+            self.hotkey.resume();
+            self.hotkey_suspended = false;
+        }
+        self.set_vault_state(VaultState::Locked);
+        self.popup.content = Content::fresh_prompt();
     }
 
     fn hide_popup(&mut self, ctx: &egui::Context) {
@@ -415,7 +457,7 @@ impl App {
         }
         self.popup.content = Content::Locking;
         self.set_vault_state(VaultState::Locking);
-        let _ = self.bw_cmd_tx.send(BwCmd::Lock);
+        self.vault.send(VaultCmd::Lock);
     }
 
     /// Re-runs `bw sync` + `bw list items` against the retained session,
@@ -438,16 +480,16 @@ impl App {
         {
             self.popup.content = Content::Syncing;
         }
-        let _ = self.bw_cmd_tx.send(BwCmd::Sync);
+        self.vault.send(VaultCmd::Sync);
     }
 
     /// The only place `bw` worker results reach stderr — names and ORDs
     /// only, per `Entry::log_line`, never a password (and only at all when
     /// `debug_log` is on — plan §8's log review, M8) — and where they feed
     /// back into the popup if it's waiting on them.
-    fn handle_bw_result(&mut self, result: BwResult) {
+    fn handle_vault_result(&mut self, result: VaultResult) {
         match result {
-            BwResult::Items { entries, dropped, stale } => {
+            VaultResult::Items { entries, dropped, stale } => {
                 // A Sync can be in flight when the tray's Lock item — still
                 // visible throughout a sync, since `vault_state` stays
                 // `Unlocked` — fires and clears `cached_entries` right out
@@ -481,19 +523,37 @@ impl App {
                 {
                     eprintln!(
                         "bw: sync did not succeed ({}): {} — showing the cached list anyway",
-                        notice.reason.summary(),
+                        notice.reason.summary(self.vault.provider()),
                         notice.detail
                     );
                 }
                 self.cached_entries = Some((entries, dropped));
                 self.sync_stale = stale;
                 self.set_vault_state(VaultState::Unlocked);
-                if matches!(self.popup.content, Content::Unlocking | Content::Syncing) {
-                    self.popup.content = Content::ShowingList {
-                        selected: 0,
-                        message: None,
+                // Also refreshes an *already-shown* list — not just the
+                // Unlocking/Syncing transitions — since `VaultCmd::List`
+                // (sent on every popup open, see `open_popup`) can now
+                // deliver an `Items` result while the popup is already
+                // sitting on `ShowingList` from a still-fresh previous
+                // fetch. Preserves the current selection rather than
+                // resetting it to 0, since this is a background refresh,
+                // not a new list appearing — and deliberately does *not*
+                // re-enter `Placing` in that case (unlike the Unlocking/
+                // Syncing transition below): the window is already
+                // correctly sized for a list, and re-placing on every
+                // background refresh would visibly jank the window under
+                // the user.
+                if let Content::Unlocking | Content::Syncing | Content::ShowingList { .. } =
+                    self.popup.content
+                {
+                    let was_already_showing_list = matches!(self.popup.content, Content::ShowingList { .. });
+                    let selected = if let Content::ShowingList { selected, .. } = self.popup.content {
+                        selected
+                    } else {
+                        0
                     };
-                    if self.popup.phase == ShowPhase::Shown {
+                    self.popup.content = Content::ShowingList { selected, message: None };
+                    if !was_already_showing_list && self.popup.phase == ShowPhase::Shown {
                         // The window is already placed/sized for the
                         // smaller Prompting/Unlocking/Syncing screen —
                         // re-enter Placing so it picks up the list's own
@@ -506,7 +566,7 @@ impl App {
                     }
                 }
             }
-            BwResult::Failed { stage, kind, message } => {
+            VaultResult::Failed { stage, kind, message } => {
                 eprintln!("bw: failed at {stage}: {message}");
                 if stage == "sync" {
                     // A sync only ever reaches `Failed` (rather than
@@ -573,7 +633,7 @@ impl App {
                     _ => {}
                 }
             }
-            BwResult::Locked => {
+            VaultResult::Locked => {
                 if self.cfg.debug_log {
                     eprintln!("bw: lock finished");
                 }
@@ -582,7 +642,7 @@ impl App {
                     self.popup.content = Content::fresh_prompt();
                 }
             }
-            BwResult::Totp(code) => {
+            VaultResult::Totp(code) => {
                 let Content::FetchingOtp { selected } = self.popup.content else {
                     return; // Stale — content already moved on.
                 };
@@ -876,7 +936,7 @@ impl App {
             Action::None => {}
             Action::Hide => self.hide_popup(ctx),
             Action::Unlock(secret) => {
-                let _ = self.bw_cmd_tx.send(BwCmd::Unlock(secret));
+                self.vault.send(VaultCmd::Unlock(secret));
                 self.popup.content = Content::Unlocking;
             }
             Action::Deliver(kind) => self.start_delivery(kind),
@@ -932,7 +992,7 @@ impl App {
                 }
                 let item_id = entry.id.clone();
                 self.popup.content = Content::FetchingOtp { selected };
-                let _ = self.bw_cmd_tx.send(BwCmd::GetTotp(item_id));
+                self.vault.send(VaultCmd::GetTotp(item_id));
             }
         }
     }
@@ -981,6 +1041,8 @@ impl App {
         }
         self.popup.target = None;
         self.popup.content = Content::Settings(ConfigWindowState {
+            provider: self.cfg.provider,
+            keepass_path: self.cfg.keepass_path.clone(),
             hotkey_spec: self.hotkey.spec(),
             recording: false,
             autostart: platform::autostart::is_enabled(),
@@ -1015,7 +1077,35 @@ impl App {
     /// rather than requiring all-or-nothing, since a failed autostart
     /// toggle is no reason to also refuse a valid hotkey change.
     fn try_apply_config_window(&mut self, state: &ConfigWindowState) -> Result<(), String> {
+        // Validated first, and refuses the whole save on failure (rather
+        // than applying the other fields and only complaining about this
+        // one) — there's no such thing as a partially-valid provider
+        // selection.
+        if state.provider == Provider::KeePass {
+            let path = state.keepass_path.trim();
+            if path.is_empty() {
+                return Err("No KeePass database selected — pick one in Settings.".to_string());
+            }
+            if !std::path::Path::new(path).is_file() {
+                return Err(format!("KeePass database not found: {path}"));
+            }
+        }
+
         let mut error = None;
+
+        // Deliberately inert as of this phase: changing the provider or the
+        // KeePass path here persists to `self.cfg` but does not yet respawn
+        // the vault worker (that's `vault::VaultHandle`, Phase 4) — the app
+        // still unconditionally runs the `bw` backend until then.
+        if state.provider != self.cfg.provider {
+            eprintln!("settings: vault provider changed to {:?}", state.provider);
+            self.cfg.provider = state.provider;
+        }
+        let trimmed_keepass_path = state.keepass_path.trim();
+        if trimmed_keepass_path != self.cfg.keepass_path {
+            eprintln!("settings: KeePass database path changed");
+            self.cfg.keepass_path = trimmed_keepass_path.to_string();
+        }
 
         if state.hotkey_spec != self.cfg.hotkey {
             match self.hotkey.set(&state.hotkey_spec) {
@@ -1081,8 +1171,16 @@ impl App {
             self.cfg.max_visible_items = clamped_max_visible;
         }
 
-        if let Err(e) = self.cfg.save() {
-            error.get_or_insert(format!("saving config: {e}"));
+        match self.cfg.save() {
+            Ok(()) => {
+                if self.vault.needs_respawn(&self.cfg) {
+                    self.vault.respawn(&self.cfg);
+                    self.reset_for_provider_switch();
+                }
+            }
+            Err(e) => {
+                error.get_or_insert(format!("saving config: {e}"));
+            }
         }
 
         error.map_or(Ok(()), Err)
@@ -1131,7 +1229,17 @@ impl eframe::App for App {
                 Msg::Tray(TrayCmd::Settings) => self.open_settings(),
                 Msg::Tray(TrayCmd::About) => self.open_about(),
                 Msg::Hotkey(target) => self.open_popup(Some(target)),
-                Msg::Bw(result) => self.handle_bw_result(result),
+                Msg::Vault { generation, result } => {
+                    // A stale generation means this result is from a
+                    // worker already torn down by a provider switch
+                    // (`respawn`) — drop it rather than resurrecting a
+                    // dead provider's entries into the live one's UI.
+                    if self.vault.accepts(generation) {
+                        self.handle_vault_result(result);
+                    } else if self.cfg.debug_log {
+                        eprintln!("vault: dropping a result from a torn-down worker (generation {generation})");
+                    }
+                }
             }
         }
 
@@ -1248,6 +1356,11 @@ impl eframe::App for App {
             Hide,
             Save(ConfigWindowState),
             Deliver(DeliveryKind),
+            /// Run the (blocking, modal) `rfd` picker — deliberately
+            /// deferred to *after* this frame's drawing, not run from
+            /// inside `config_window::draw`: see `config_window::Action::
+            /// BrowseKeepass`'s doc for why.
+            BrowseKeepass,
         }
         let mut post_action = None;
 
@@ -1331,6 +1444,9 @@ impl eframe::App for App {
                         }
                         post_action = Some(PostAction::Save(state.clone()));
                     }
+                    config_window::Action::BrowseKeepass => {
+                        post_action = Some(PostAction::BrowseKeepass);
+                    }
                 }
             }
             Content::About => {
@@ -1352,6 +1468,17 @@ impl eframe::App for App {
                 }
             },
             Some(PostAction::Deliver(kind)) => self.start_delivery(kind),
+            Some(PostAction::BrowseKeepass) => {
+                let picked = rfd::FileDialog::new()
+                    .add_filter("KeePass database", &["kdbx"])
+                    .set_title("Choose a KeePass database")
+                    .pick_file();
+                if let Some(path) = picked
+                    && let Content::Settings(s) = &mut self.popup.content
+                {
+                    s.keepass_path = path.to_string_lossy().into_owned();
+                }
+            }
         }
     }
 }

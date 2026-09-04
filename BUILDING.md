@@ -163,6 +163,38 @@ SmartScreen will warn on first run of a freshly downloaded build — expected, n
 signing would need an Authenticode certificate (from a CA or an EV token) and a `signtool sign`
 step added to the release workflow after each installer is built.
 
+## macOS: keeping the Accessibility grant across rebuilds
+
+`context-password` needs the Accessibility permission (`AXIsProcessTrusted`, checked in
+`src/platform/mac/permissions.rs`) to post synthetic keystrokes into another app. macOS's TCC ties
+that grant to the binary's *code identity*, not its path. `cargo build`'s debug output is
+unsigned, and an unsigned/ad-hoc binary's identity is derived from a hash of its own bytes — so
+**every rebuild is a new app as far as TCC is concerned**, and a grant given to yesterday's build
+silently stops applying even though the checkbox in System Settings still looks checked.
+`AXIsProcessTrusted()` then returns false and delivery aborts with `BlockReason::NoAccessibility`
+— macOS dev-loop friction, not a bug in this app.
+
+Fix once per machine:
+
+1. Keychain Access → menu **Keychain Access → Certificate Assistant → Create a Certificate…**
+   - Name: anything memorable, e.g. `context-password-dev`
+   - Identity Type: **Self Signed Root**
+   - Certificate Type: **Code Signing**
+   - Accept the defaults for everything else.
+2. Sign the debug binary with it after every build:
+   ```
+   codesign --force --sign "context-password-dev" target/debug/context-password
+   ```
+3. Launch the app once, then grant Accessibility: trigger the hotkey (macOS prompts
+   automatically), or add it manually via System Settings → Privacy & Security → Accessibility →
+   **+** → navigate to `target/debug/context-password` → enable the checkbox.
+
+Because the identity comes from the certificate rather than the binary's contents, it stays the
+same across rebuilds as long as step 2 is re-run each time — the existing grant keeps applying
+without re-prompting. If Accessibility was previously granted to an unsigned build, remove that
+stale row first (select it, click **-**) before re-adding the signed one, since a duplicate stale
+entry can otherwise mask whether the fix took effect.
+
 ## Troubleshooting
 
 | Symptom | Cause |
@@ -171,3 +203,4 @@ step added to the release workflow after each installer is built.
 | `makensis` isn't recognized | NSIS isn't installed, or isn't on PATH. |
 | A second launch exits immediately with no window | Expected — the single-instance guard is working; check the system tray for the existing instance. |
 | The hotkey doesn't fire | Another application may already be using the same combination; try changing it in Settings. |
+| (macOS) Accessibility looks granted but delivery still fails with `NoAccessibility` | Debug builds are unsigned, so each rebuild is a new identity to TCC — see [macOS: keeping the Accessibility grant across rebuilds](#macos-keeping-the-accessibility-grant-across-rebuilds). |

@@ -8,6 +8,7 @@ mod bw;
 mod config;
 mod controller;
 mod hotkey;
+mod keepass;
 #[cfg(target_os = "macos")]
 mod mac_ui;
 mod msg;
@@ -16,6 +17,7 @@ mod secret;
 mod tray;
 #[cfg(windows)]
 mod ui;
+mod vault;
 
 #[cfg(windows)]
 use config::Config;

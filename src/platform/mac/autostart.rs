@@ -5,20 +5,59 @@
 //! `CFBundleIdentifier`; calling it from the unbundled dev binary fails
 //! with a signature/bundle error, surfaced here as a clear message rather
 //! than a confusing OS error code.
+//!
+//! There is no macOS packaging yet (`packaging/` is NSIS-only), so today
+//! `is_available()` is always `false` on this platform and the Settings
+//! checkbox stays disabled with a note explaining why — see
+//! `mac_ui::settings`. This module still does the right thing the moment
+//! packaging exists, with no further changes needed here.
 
+use objc2_foundation::NSBundle;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
+
+/// True only when running from inside a real `.app` bundle: `NSBundle`
+/// reports a `CFBundleIdentifier` *and* the running executable actually
+/// sits under a `Contents/MacOS/` directory (a bare binary launched next to
+/// a stray `Info.plist` would satisfy the first check alone). Both
+/// `is_enabled`/`set_enabled` behave correctly regardless, but calling them
+/// outside a bundle either fails outright or reports a status that can
+/// never become `Enabled` — so the UI checks this first and disables the
+/// control instead of offering a setting that can't work.
+pub fn is_available() -> bool {
+    let has_bundle_id = NSBundle::mainBundle().bundleIdentifier().is_some();
+    let in_app_bundle = std::env::current_exe()
+        .map(|p| p.components().any(|c| c.as_os_str() == "Contents"))
+        .unwrap_or(false);
+    has_bundle_id && in_app_bundle
+}
 
 /// Reads the live status from `SMAppService` rather than trusting a config
 /// flag, since the user may have removed it via System Settings' Login
 /// Items list directly — same "reflect reality, not our last write"
-/// posture as `win::autostart::is_enabled`.
+/// posture as `win::autostart::is_enabled`. `RequiresApproval` counts as
+/// enabled: the service *is* registered, the user just hasn't clicked
+/// through System Settings' approval prompt yet — reporting that as "off"
+/// is what previously made the checkbox flip back unchecked right after a
+/// successful registration.
 pub fn is_enabled() -> bool {
     let service = unsafe { SMAppService::mainAppService() };
-    matches!(unsafe { service.status() }, SMAppServiceStatus::Enabled)
+    matches!(
+        unsafe { service.status() },
+        SMAppServiceStatus::Enabled | SMAppServiceStatus::RequiresApproval
+    )
 }
 
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
     let service = unsafe { SMAppService::mainAppService() };
+    if !enabled && matches!(unsafe { service.status() }, SMAppServiceStatus::NotRegistered) {
+        // Unregistering something that's already unregistered isn't a
+        // failure from the caller's point of view — the end state (not
+        // present) matches. Mirrors win::autostart's ERROR_FILE_NOT_FOUND
+        // swallow on delete, and is what closes the loop where reading
+        // back a not-quite-`Enabled` status as "off" then made Save try to
+        // unregister an already-unregistered service.
+        return Ok(());
+    }
     let result = if enabled {
         unsafe { service.registerAndReturnError() }
     } else {

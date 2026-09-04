@@ -12,6 +12,7 @@
 use eframe::egui;
 
 use crate::config::{MAX_VISIBLE_ITEMS, MIN_VISIBLE_ITEMS};
+use crate::vault::Provider;
 
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(0xcc, 0x33, 0x33);
 const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(0x33, 0x99, 0x33);
@@ -29,6 +30,10 @@ const STEP_BUTTON_WIDTH: f32 = 32.0;
 /// `Config` until Save is clicked, so a cancelled dialog changes nothing.
 #[derive(Clone)]
 pub struct ConfigWindowState {
+    pub provider: Provider,
+    /// Path to the `.kdbx` file, when `provider` is `KeePass`. Empty means
+    /// "not chosen yet".
+    pub keepass_path: String,
     pub hotkey_spec: String,
     pub recording: bool,
     pub autostart: bool,
@@ -72,6 +77,12 @@ pub enum Action {
     None,
     Save,
     Cancel,
+    /// The Browse… button was clicked — `app.rs` runs the (blocking, modal)
+    /// `rfd` picker *after* this frame's `draw()` returns, not from inside
+    /// it: `rfd::FileDialog::pick_file()` enters its own modal loop, and
+    /// calling it mid-frame would stall a frame in a paradigm (egui's
+    /// immediate-mode `update()`) that assumes `draw()` returns promptly.
+    BrowseKeepass,
 }
 
 pub fn draw(ui: &mut egui::Ui, state: &mut ConfigWindowState) -> Action {
@@ -124,6 +135,30 @@ pub fn draw(ui: &mut egui::Ui, state: &mut ConfigWindowState) -> Action {
             ui.heading("Context Password | Settings");
             ui.separator();
             ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Vault:");
+                egui::ComboBox::from_id_salt("provider")
+                    .selected_text(match state.provider {
+                        Provider::Bitwarden => "Bitwarden (bw CLI)",
+                        Provider::KeePass => "KeePass (.kdbx)",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut state.provider, Provider::Bitwarden, "Bitwarden (bw CLI)");
+                        ui.selectable_value(&mut state.provider, Provider::KeePass, "KeePass (.kdbx)");
+                    });
+            });
+            if state.provider == Provider::KeePass {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Database:");
+                    ui.add(egui::TextEdit::singleline(&mut state.keepass_path).desired_width(220.0));
+                    if ui.button("Browse…").clicked() {
+                        action = Action::BrowseKeepass;
+                    }
+                });
+            }
+            ui.add_space(12.0);
 
             ui.label("Global hotkey:");
             egui::Sides::new().show(

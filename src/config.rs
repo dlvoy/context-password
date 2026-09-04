@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::vault::Provider;
+
 /// Bounds for `max_visible_items`, enforced both by the Settings widget and
 /// defensively by `Config::effective_max_visible`.
 pub const MIN_VISIBLE_ITEMS: u32 = 3;
@@ -32,10 +34,20 @@ pub struct Config {
     pub unlock_mode: UnlockMode,
     pub unlock_delay_secs: u32,
     pub autostart: bool,
+    /// Which credential backend to talk to. Defaults to `Bitwarden`, so a
+    /// config file written before this field existed keeps working
+    /// unchanged (the struct-level `#[serde(default)]` above is what makes
+    /// that automatic).
+    pub provider: Provider,
     /// Empty means "autodetect on PATH / known install locations".
     pub bw_path: String,
+    /// Path to the `.kdbx` file, when `provider` is `KeePass`. Empty means
+    /// "not chosen yet" — unlocking fails with a clear "pick one in
+    /// Settings" message rather than a raw file-not-found error.
+    pub keepass_path: String,
     /// The `app://` prefix used both to filter vault items and as the `bw
-    /// list --search` prefilter term.
+    /// list --search` prefilter term. Shared by both providers — it's the
+    /// same tag grammar either way (see `vault::tag`).
     pub uri_prefix: String,
     /// How long to wait after regaining foreground before typing starts.
     pub type_settle_ms: u32,
@@ -64,7 +76,9 @@ impl Default for Config {
             unlock_mode: UnlockMode::Delayed,
             unlock_delay_secs: 20,
             autostart: false,
+            provider: Provider::Bitwarden,
             bw_path: String::new(),
+            keepass_path: String::new(),
             uri_prefix: "app://context-password".to_string(),
             type_settle_ms: 30,
             max_visible_items: 4,
@@ -81,6 +95,19 @@ impl Config {
     /// for an out-of-range count.
     pub fn effective_max_visible(&self) -> usize {
         self.max_visible_items.clamp(MIN_VISIBLE_ITEMS, MAX_VISIBLE_ITEMS) as usize
+    }
+
+    /// `Err` with a user-facing reason when the current provider isn't
+    /// usable yet — today that's only "KeePass selected but no database
+    /// chosen". Used both by Settings validation (refuse to save) and the
+    /// worker's own guard (`keepass::unlock_and_list` returns the same
+    /// message independently, since a config file could be hand-edited
+    /// into this state without ever going through Settings).
+    pub fn provider_ready(&self) -> Result<(), String> {
+        if self.provider == Provider::KeePass && self.keepass_path.trim().is_empty() {
+            return Err("No KeePass database selected — pick one in Settings.".to_string());
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -159,6 +186,42 @@ mod tests {
         let cfg: Config = toml::from_str(r#"hotkey = "Ctrl+Alt+KeyB""#).unwrap();
         assert_eq!(cfg.hotkey, "Ctrl+Alt+KeyB");
         assert_eq!(cfg.unlock_delay_secs, Config::default().unlock_delay_secs);
+        // The single most important compatibility property of the KeePass
+        // provider work: a config file from before `provider` existed must
+        // land on Bitwarden, not on some arbitrary default.
+        assert_eq!(cfg.provider, Provider::Bitwarden);
+    }
+
+    #[test]
+    fn provider_serializes_as_expected_toml_strings() {
+        // `#[serde(rename_all = "snake_case")]` alone would write `KeePass`
+        // as "kee_pass" — an ugly, permanent wart in every user's
+        // config.toml. Guards the explicit `#[serde(rename = "keepass")]`
+        // override on that variant.
+        let bw = Config { provider: Provider::Bitwarden, ..Config::default() };
+        assert!(toml::to_string(&bw).unwrap().contains(r#"provider = "bitwarden""#));
+
+        let kp = Config { provider: Provider::KeePass, ..Config::default() };
+        assert!(toml::to_string(&kp).unwrap().contains(r#"provider = "keepass""#));
+
+        let parsed: Config = toml::from_str(r#"provider = "keepass""#).unwrap();
+        assert_eq!(parsed.provider, Provider::KeePass);
+    }
+
+    #[test]
+    fn provider_ready_requires_a_keepass_path_only_for_the_keepass_provider() {
+        let bw = Config { provider: Provider::Bitwarden, keepass_path: String::new(), ..Config::default() };
+        assert!(bw.provider_ready().is_ok());
+
+        let kp_unset = Config { provider: Provider::KeePass, keepass_path: String::new(), ..Config::default() };
+        assert!(kp_unset.provider_ready().is_err());
+
+        let kp_set = Config {
+            provider: Provider::KeePass,
+            keepass_path: "/tmp/whatever.kdbx".to_string(),
+            ..Config::default()
+        };
+        assert!(kp_set.provider_ready().is_ok());
     }
 
     #[test]
