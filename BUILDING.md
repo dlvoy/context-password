@@ -4,23 +4,28 @@
 
 | Command | Artifact |
 | --- | --- |
-| `cargo build` | `target\debug\context-password.exe` |
-| `cargo build --release` | `target\release\context-password.exe` |
-| `cargo wix` | `target\wix\context-password-<version>-x86_64.msi` |
-| `makensis packaging\installer.nsi` | `target\release\ContextPassword-<version>-x64-setup.exe` |
-| `cargo bundle` | all three of the above, one command |
+| `cargo build` | `target\debug\context-password.exe` (Windows) / `target/debug/context-password` (macOS) |
+| `cargo build --release` | `target\release\context-password.exe` / `target/release/context-password` |
+| `cargo wix` (Windows) | `target\wix\context-password-<version>-x86_64.msi` |
+| `makensis packaging\installer.nsi` (Windows) | `target\release\ContextPassword-<version>-x64-setup.exe` |
+| `cargo packager --release` (macOS) | `target/packager/Context Password.app`, `target/packager/Context Password_<version>_universal.dmg` |
+| `cargo bundle` | everything above for the host platform, one command |
 
 ## Prerequisites
 
-- **Rust**, MSVC toolchain — `rustup default stable-x86_64-pc-windows-msvc`. The crate is on
-  edition 2024 and was built and tested against rustc 1.97.1; anything close to that works.
-- **Windows 10 or 11**, to build the full app today. A macOS port is in progress but not yet
-  buildable end to end — see [macOS](#macos-work-in-progress) below.
-- Building the installers additionally needs:
+- **Rust**, edition 2024, tested against rustc 1.97.1; anything close to that works.
+  - Windows: the MSVC toolchain — `rustup default stable-x86_64-pc-windows-msvc`.
+  - macOS: `rustup default stable` is enough for the host architecture; the universal-binary build
+    additionally needs both Apple targets — `rustup target add aarch64-apple-darwin
+    x86_64-apple-darwin`.
+- Building the Windows installers additionally needs:
   - **`cargo-wix`** (`cargo install cargo-wix`) and the **WiX Toolset v3** (`choco install
     wixtoolset`, or download from the WiX Toolset website) for the MSI.
   - **NSIS** (`choco install nsis`, or download from the NSIS website) for the `.exe` installer.
   - Neither is needed for a plain `cargo build`.
+- Building the macOS `.app`/`.dmg` additionally needs **Xcode Command Line Tools**
+  (`xcode-select --install` — provides `clang`, `codesign`, `lipo`, `iconutil`, `sips`, `hdiutil`)
+  and **`cargo-packager`** (`cargo install cargo-packager --locked`). See [macOS](#macos) below.
 
 ## Commands
 
@@ -30,16 +35,17 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
-Regenerating the icon (only needed if `development/logo.png` changes — not run by a normal build):
+Regenerating the app icon (only needed if `development/logo.png` changes — not run by a normal
+build; `development/` is gitignored, so this is a local, as-needed step, not part of CI):
 
 ```
-powershell -ExecutionPolicy Bypass -File resources\generate-icons.ps1
+powershell -ExecutionPolicy Bypass -File resources\generate-icons.ps1   # Windows: app.ico, tray_icon.rgba
+bash resources/generate-icons-macos.sh                                  # macOS: AppIcon.icns
 ```
 
-This overwrites `resources\app.ico` and `resources\tray_icon.rgba` from the source PNG.
-
-Building everything — the release binary, the MSI, and the NSIS installer, in that order, stopping
-at the first failure:
+Building everything for the host platform — on Windows, the release binary, the MSI, and the NSIS
+installer, in that order; on macOS, both architectures, `lipo`'d into a universal binary, then the
+`.app` and `.dmg` — stopping at the first failure:
 
 ```
 cargo bundle
@@ -47,7 +53,8 @@ cargo bundle
 
 This is a small `xtask` crate (`xtask/`, aliased in `.cargo/config.toml`) — a separate crate, not
 part of the main project, so it can never affect `context-password`'s own build or dependencies.
-It shells out to exactly the commands below; run them individually instead if you only need one.
+It shells out to exactly the commands below (or their macOS equivalents, see
+[macOS](#macos)); run them individually instead if you only need one.
 
 Building the MSI alone (needs `cargo build --release` first, and `cargo-wix` installed):
 
@@ -72,78 +79,94 @@ Pass `/DPRODUCT_VERSION=x.y.z` to stamp a specific version into the installer's 
 filename; without it, the installer is named with a `0.0.0` placeholder. `cargo bundle` does this
 automatically, reading the version straight from `Cargo.toml`.
 
-## macOS (work in progress)
+## macOS
 
-The macOS port isn't finished — full status, the phased plan, and the design decisions behind it
-live in `../context-password-project/plan/macos-port-plan.md`, a sibling repo to this one (kept
-outside `context-password` itself so the plan can be pulled onto another machine independently of
-this repo's history). This section only covers what needs to be installed to pick the work back up.
+The macOS port (native AppKit front-end, `src/mac_ui/`) and packaging are both done and released.
+The phased plan and the design decisions behind the port live in
+`../context-password-project/plan/macos-port-plan.md`, a sibling repo to this one (kept outside
+`context-password` itself so the plan can be pulled onto another machine independently of this
+repo's history) — useful background, not required reading to build the app.
 
 ### Prerequisites
 
-- **A real Mac.** Apple licenses the macOS SDK for use on Apple hardware only, and the actually
-  risky parts of this port — the Accessibility/TCC permission, Secure Input, and WindowServer's
-  synthetic-event filtering — can only be observed on real hardware. See the plan's Phase 0.
+- **A real Mac.** Apple licenses the macOS SDK for use on Apple hardware only.
 - **Xcode Command Line Tools**: `xcode-select --install`. Provides the macOS SDK, `clang`,
-  `codesign`, `lipo`, `iconutil`, `sips`, and `hdiutil` — everything Phase 4's packaging needs, and
-  what linking the `objc2`/AppKit bindings from Phase 2 onward requires.
-- **Rust**, same edition and version as Windows (edition 2024, tested against rustc 1.97.1) —
-  `rustup default stable` is enough for the host architecture. For the universal binary Phase 4
-  calls for: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
-- **The Bitwarden CLI** (`bw`): `brew install bitwarden-cli` (or `npm install -g @bitwarden/cli`),
-  then `bw login` / `bw unlock` as in the main [README](README.md#setting-up-bitwarden). Homebrew
-  installs to `/opt/homebrew/bin` on Apple Silicon or `/usr/local/bin` on Intel — neither is on the
-  minimal `PATH` a GUI-launched `.app` inherits, which is why the macOS arm of `bw::exe`'s discovery
-  (Phase 2, not yet written) has to check both locations plus `~/.npm-global/bin` explicitly, the
-  same way the `bw_path` Settings override is the escape hatch on Windows.
-- For packaging, once Phase 4 starts: `cargo install cargo-packager`, for `.app`/`.dmg` bundling.
-  Signing and notarization use `codesign`/`notarytool` from Xcode Command Line Tools, already
-  above — ad-hoc signing needs nothing further; a paid Developer ID identity is only needed to turn
-  on real notarization later.
+  `codesign`, `lipo`, `iconutil`, `sips`, and `hdiutil`.
+- **Rust**, same edition and version as Windows — `rustup default stable`, plus
+  `rustup target add aarch64-apple-darwin x86_64-apple-darwin` for the universal binary `cargo
+  bundle` produces.
+- **`cargo-packager`** (`cargo install cargo-packager --locked`) for `.app`/`.dmg` bundling —
+  invoked by `xtask`'s macOS branch, not a project dependency (same relationship `cargo-wix` has
+  to the Windows side).
+- **The Bitwarden CLI** (`bw`), if you plan to use the Bitwarden provider rather than KeePass:
+  `brew install bitwarden-cli` (or `npm install -g @bitwarden/cli`), then `bw login` / `bw unlock`
+  as in the main [README](README.md#setting-up-bitwarden). Homebrew installs to
+  `/opt/homebrew/bin` on Apple Silicon or `/usr/local/bin` on Intel — neither is on the minimal
+  `PATH` a GUI-launched `.app` inherits, which is why `bw::exe`'s discovery checks both locations
+  plus `~/.npm-global/bin` explicitly, the same way the `bw_path` Settings override is the escape
+  hatch on Windows.
 
-### Where things stand
+### Building and packaging
 
-`cargo build`/`cargo test` on macOS itself won't fully succeed yet: `src/app.rs`, `src/ui/`, and
-`main.rs` are still unconditionally Windows/`eframe`-specific and haven't been split out from the
-future `mac_ui` front-end (tracked in the plan as the deferred step 1d). What already compiles
-cleanly for a macOS target today is the shared core underneath that UI layer — `src/bw/`,
-`src/config.rs`, `src/secret.rs`, `src/msg.rs`, `src/hotkey.rs`, `src/tray.rs`, and the
-`src/platform/` `#[cfg]` switch itself (`src/platform/win/` behind `#[cfg(windows)]`, with
-`src/platform/mac/` still to come). That was verified without a Mac at all, from Windows, since
-`rustup target add aarch64-apple-darwin` downloads a prebuilt std even without the SDK:
+`cargo build` / `cargo test` / `cargo clippy` work directly on macOS, same as Windows. `cargo
+bundle` (via `xtask`) builds both architectures, combines them with `lipo`, and packages the
+result:
+
+```
+cargo bundle
+```
+
+Signing is **ad-hoc by default** (`Cargo.toml`'s `[package.metadata.packager.macos]`,
+`signing-identity = "-"`) — no secrets or paid account needed for a local or CI build; every build
+signs, none are notarized. See [Code signing](#code-signing) below for what changes with a real
+Apple Developer ID.
+
+Cross-checking macOS-only code from Windows, without a Mac (type-checks but can't link, since
+there's no SDK — still useful to catch a shared file accidentally picking up Windows-only code):
 
 ```
 rustup target add aarch64-apple-darwin
 cargo check --target aarch64-apple-darwin
 ```
 
-This type-checks everything but can't link (no SDK), so it stops at the still-Windows-only files
-rather than succeeding outright — useful as a quick way to catch a shared file accidentally picking
-up Windows-only code, from either machine. On the Mac itself, once there's a macOS entry point to
-check against, plain `cargo check` (no `--target`) is the equivalent sanity check against the host.
-
 ## Project layout
 
-- `src/app.rs` — the `eframe::App` implementation: the popup's show/hide and content-state
-  machine, and the typing-delivery phase machine.
-- `src/bw/` — everything that talks to the `bw` CLI: the worker thread, executable resolution,
-  command building, and client-side filtering of vault items.
-- `src/ui/` — pure rendering functions for each popup screen (prompt, item list, Settings, About).
-- `src/platform/win/` — Win32 specifics: focus capture/restore, window placement, autostart,
-  typing. A future macOS port lands alongside it as `src/platform/mac/`, both exposing the same
-  module API via `src/platform/mod.rs`'s `#[cfg]` switch.
+- `src/app.rs`, `src/ui/` — the Windows front-end: the `eframe::App` implementation (popup
+  show/hide and content-state machine, typing-delivery phase machine) and its pure rendering
+  functions (prompt, item list, Settings, About).
+- `src/mac_ui/` — the macOS front-end: native AppKit (`objc2`/`objc2-app-kit`), no egui. Owns the
+  same state machines as `src/app.rs`/`src/ui/` but expressed as `NSPanel`/`NSWindow` controls
+  instead of immediate-mode drawing.
+- `src/controller.rs` — the platform-neutral popup state machine (`VaultState`, delivery/indicator
+  phases) both front-ends drive.
+- `src/vault/` — the provider-agnostic layer both credential backends build on: the shared `Entry`
+  type, the tag-matching grammar that decides which vault items belong to this app's popup, and
+  `VaultHandle` (spawns/respawns whichever backend is active, live, without a restart).
+- `src/bw/` — the Bitwarden provider: the `bw` CLI worker thread, executable resolution, command
+  building, and client-side filtering.
+- `src/keepass/` — the KeePass (KDBX) provider: local unlock/list/TOTP via `keepass-core`, no
+  server or CLI.
+- `src/platform/win/`, `src/platform/mac/` — OS-specific: focus capture/restore, window placement,
+  autostart, typing, both exposing the same module API via `src/platform/mod.rs`'s `#[cfg]` switch.
 - `src/hotkey.rs`, `src/config.rs`, `src/secret.rs`, `src/msg.rs`, `src/tray.rs` — the global
   hotkey registration, on-disk config, the password-holding type, the inter-thread message enum,
-  and the tray icon/menu.
+  and the tray icon/menu (shared by both platforms).
 - `xtask/` — the `cargo bundle` helper (see above). A separate crate, not part of the main build.
+- `resources/` — icons and platform resource files (`app.ico`/`app.manifest`/`app.rc` for
+  Windows, `AppIcon.icns`/`macos/entitlements.plist` for macOS), plus the two icon-regeneration
+  scripts.
+- `packaging/` — `installer.nsi` (Windows NSIS script). macOS's packaging config lives in
+  `Cargo.toml`'s `[package.metadata.packager]` instead — `cargo-packager` needs no separate script.
 
 ## The release pipeline
 
-`.github/workflows/release.yml` runs on a pushed `vX.Y.Z` tag (or manually, for a dry run). It
-checks that `Cargo.toml`'s version matches the tag, runs the test suite, builds the release binary,
-builds both installers, computes a `checksums.txt`, and uploads everything as a build artifact. On
-an actual tag push, it also publishes a GitHub Release with the exe, the MSI, the NSIS installer,
-and the checksums attached.
+`.github/workflows/release.yml` runs on a pushed `vX.Y.Z` tag (or manually, for a dry run) as four
+jobs: `meta` (works out the version, checks it matches `Cargo.toml`), `release-windows` and
+`release-macos` (test, lint, build, package — independently, in parallel), and `publish` (only on
+an actual tag push — downloads both platforms' artifacts, writes the release notes, and creates
+one GitHub Release covering both). `.github/workflows/ci.yml` runs the test-and-lint half of that
+— matrixed over both platforms — on every push and pull request, so a broken commit is caught
+long before anyone tags a release.
 
 ## Cutting a release
 
@@ -154,14 +177,26 @@ and the checksums attached.
 5. Tag: `git tag vX.Y.Z`.
 6. Push: `git push --follow-tags`.
 
-Pushing the tag triggers the release workflow.
+Pushing the tag triggers the release workflow, which builds and publishes both platforms.
 
 ## Code signing
 
-Release builds are unsigned. There is no code-signing certificate for this project, so Windows
-SmartScreen will warn on first run of a freshly downloaded build — expected, not a bug. Real
-signing would need an Authenticode certificate (from a CA or an EV token) and a `signtool sign`
-step added to the release workflow after each installer is built.
+**Windows** release builds are unsigned — there is no code-signing certificate for this project,
+so SmartScreen warns on first run of a freshly downloaded build. Real signing would need an
+Authenticode certificate (from a CA or an EV token) and a `signtool sign` step added to the
+release workflow after each installer is built.
+
+**macOS** release builds are signed ad-hoc (`signing-identity = "-"` in `Cargo.toml`) — enough to
+run locally without Gatekeeper's stronger warnings being fully silenced, but a fresh download
+still needs the right-click-to-open workaround the README describes, since ad-hoc signing alone
+doesn't satisfy Gatekeeper's "identified developer" check. `release-macos` in `release.yml` also
+reads `APPLE_CERTIFICATE`/`APPLE_CERTIFICATE_PASSWORD`/`APPLE_SIGNING_IDENTITY` and notarization
+credentials (`APPLE_KEYCHAIN_PROFILE`, or `APPLE_ID`+`APPLE_PASSWORD`+`APPLE_TEAM_ID`, or an App
+Store Connect API key) from repository secrets — when present, `cargo-packager` signs with the
+real Developer ID identity and notarizes automatically; when absent (the default today), it falls
+back to ad-hoc and skips notarization with a warning, not a failure. Configuring a real Apple
+Developer ID account for this is documented separately, outside this repo:
+`context-password-project/development/apple-signing-setup.md`.
 
 ## macOS: keeping the Accessibility grant across rebuilds
 
@@ -172,7 +207,9 @@ unsigned, and an unsigned/ad-hoc binary's identity is derived from a hash of its
 **every rebuild is a new app as far as TCC is concerned**, and a grant given to yesterday's build
 silently stops applying even though the checkbox in System Settings still looks checked.
 `AXIsProcessTrusted()` then returns false and delivery aborts with `BlockReason::NoAccessibility`
-— macOS dev-loop friction, not a bug in this app.
+— macOS dev-loop friction, not a bug in this app. (This is specific to the raw `target/debug`
+binary — a `cargo bundle`-packaged `.app` is signed the same way on every build, ad-hoc or not, so
+its Accessibility grant is stable across rebuilds without any of the below.)
 
 Fix once per machine:
 
@@ -203,4 +240,7 @@ entry can otherwise mask whether the fix took effect.
 | `makensis` isn't recognized | NSIS isn't installed, or isn't on PATH. |
 | A second launch exits immediately with no window | Expected — the single-instance guard is working; check the system tray for the existing instance. |
 | The hotkey doesn't fire | Another application may already be using the same combination; try changing it in Settings. |
-| (macOS) Accessibility looks granted but delivery still fails with `NoAccessibility` | Debug builds are unsigned, so each rebuild is a new identity to TCC — see [macOS: keeping the Accessibility grant across rebuilds](#macos-keeping-the-accessibility-grant-across-rebuilds). |
+| (macOS) Accessibility looks granted but delivery still fails with `NoAccessibility` | Debug builds are unsigned, so each rebuild is a new identity to TCC — see [macOS: keeping the Accessibility grant across rebuilds](#macos-keeping-the-accessibility-grant-across-rebuilds). Packaged `.app` builds don't have this problem. |
+| (macOS) `cargo packager` fails immediately | It isn't installed — `cargo install cargo-packager --locked`. |
+| (macOS) `cargo bundle` fails at the `lipo` step | One of the two `rustup target add` targets (`aarch64-apple-darwin`, `x86_64-apple-darwin`) is missing. |
+| (macOS) The downloaded `.dmg`'s app won't open from a double-click (Gatekeeper warns or refuses) | Expected for an ad-hoc-signed, unnotarized build — confirmed with `spctl -a -vv`, which reports `rejected` for exactly this reason. Right-click (Control-click) the app and choose **Open**, then **Open** again in the dialog; if that doesn't clear it, `xattr -dr com.apple.quarantine "Context Password.app"` removes the flag Gatekeeper is reacting to. |

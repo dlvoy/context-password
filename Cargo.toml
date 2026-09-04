@@ -112,3 +112,40 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# macOS `.app`/`.dmg` packaging, driven by `cargo packager` (installed
+# separately, like `cargo-wix` — not a project dependency) from `xtask`'s
+# macOS branch. `binaries`/`binaries-dir` point at the universal
+# (`lipo -create`) binary `xtask` builds beforehand; `before-packaging-command`
+# is deliberately left unset so `cargo packager` never tries to build on its
+# own. This section is inert on Windows — nothing here is read unless
+# `cargo packager` is actually invoked.
+[package.metadata.packager]
+product-name = "Context Password"
+identifier = "pl.dzienia.context-password"
+formats = ["app", "dmg"]
+icons = ["resources/AppIcon.icns"]
+out-dir = "target/packager"
+binaries-dir = "target/universal/release"
+# Defaults to the host's own target triple, which would otherwise name the
+# DMG e.g. "..._aarch64.dmg" — misleading, since the binary in it is the
+# lipo'd universal one. "universal-apple-darwin" is the same convention
+# Tauri's own macOS universal builds use.
+target-triple = "universal-apple-darwin"
+
+[[package.metadata.packager.binaries]]
+path = "context-password"
+main = true
+
+[package.metadata.packager.macos]
+# SMAppService ("Open at Login") requires macOS 13+.
+minimum-system-version = "13.0"
+# Sets LSUIElement — tray-only, no Dock icon.
+background-app = true
+entitlements = "resources/macos/entitlements.plist"
+# Ad-hoc by default, so every local and CI build signs with no secrets
+# needed — codesign accepts the literal "-" for this. Real Developer ID
+# signing overrides this per-invocation via `cargo packager`'s `--config`
+# flag; see `xtask` and `context-password-project/development/
+# apple-signing-setup.md` for how that's wired and configured.
+signing-identity = "-"

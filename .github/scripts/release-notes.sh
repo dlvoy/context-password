@@ -32,12 +32,25 @@ ${notes}
 
 ## Downloads
 
+### Windows
+
 | File | Use |
 | --- | --- |
 | \`ContextPassword-${version}-x64-setup.exe\` | Installer. Adds a Start Menu entry and an uninstaller. |
 | \`ContextPassword-${version}-x64-portable.exe\` | The application on its own, nothing to install. |
 | \`ContextPassword-${version}-x64.msi\` | For deployment through Group Policy or Intune. |
 
-These builds are unsigned, so Windows SmartScreen warns on first run. Choose **More info**, then
+This build is unsigned, so Windows SmartScreen warns on first run. Choose **More info**, then
 **Run anyway**.
+
+### macOS
+
+| File | Use |
+| --- | --- |
+| \`ContextPassword-${version}-universal.dmg\` | Disk image — open it, drag Context Password into Applications. Runs on Apple Silicon and Intel. |
+
+This build is signed ad-hoc, not notarized, so Gatekeeper will warn or refuse to open it on first
+launch. Right-click (or Control-click) the app and choose **Open**, then **Open** again in the
+dialog — needed only the first time. If that doesn't clear it, remove the quarantine flag
+directly: \`xattr -dr com.apple.quarantine "Context Password.app"\`.
 EOF

@@ -1,0 +1,43 @@
+name: CI
+
+# Catches a broken commit before release time. Before this workflow existed,
+# `cargo test`/`clippy` only ran on the release path (a pushed `vX.Y.Z` tag)
+# — with two platforms that gap gets worse, not better, so this runs on
+# every push and pull request instead. Deliberately no packaging, signing,
+# or artifacts here — that's release.yml's job; this one only has to answer
+# "does it build, pass its tests, and lint clean, on both platforms."
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Harmless extra weight on Windows (the toolchain step just adds
+          # targets it'll never build for) — simpler than branching this
+          # per OS for two target names.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ matrix.os }}
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings

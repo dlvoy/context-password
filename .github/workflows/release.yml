@@ -18,8 +18,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: windows-latest
+  # Version/tag logic lives here once rather than duplicated per platform —
+  # both platform jobs `needs: meta` and read its outputs; if the tag check
+  # below fails, neither platform job runs at all.
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      release: ${{ steps.meta.outputs.release }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
 
@@ -47,7 +54,7 @@ jobs:
 
       # The installers take their version from Cargo.toml, not from the
       # tag. If those drift, the release ships artifacts labelled with the
-      # wrong version, so stop before spending time on the build.
+      # wrong version, so stop before spending time on either platform build.
       - name: Check the tag matches Cargo.toml
         if: steps.meta.outputs.release == 'true'
         shell: bash
@@ -61,6 +68,12 @@ jobs:
             exit 1
           fi
           echo "ok  Cargo.toml = ${got}"
+
+  release-windows:
+    needs: meta
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -97,16 +110,18 @@ jobs:
 
       # Builds the release binary, then the MSI, then the NSIS installer —
       # see xtask/src/main.rs. Reads the version straight from Cargo.toml,
-      # already checked against the tag above.
+      # already checked against the tag by the `meta` job.
       - name: Build everything
         run: cargo bundle
 
       - name: Collect artifacts
         shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          version="${{ steps.meta.outputs.version }}"
+          version="$VERSION"
           mkdir -p release
 
           # Globs are scoped to this version rather than left open, so a
@@ -133,35 +148,141 @@ jobs:
           ls -lh
           cat checksums.txt
 
-      - name: Assemble release notes
-        if: steps.meta.outputs.release == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash .github/scripts/release-notes.sh "${{ steps.meta.outputs.version }}" > notes.md
-          echo "--- release notes ---"
-          cat notes.md
-
       # Uploaded even on a manual run, so a build can be checked without
       # publishing anything.
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: context-password-${{ steps.meta.outputs.version }}-windows-x64
+          name: context-password-${{ needs.meta.outputs.version }}-windows-x64
           path: release/*
           if-no-files-found: error
           retention-days: 14
 
+  release-macos:
+    needs: meta
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-release
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+
+      # Builds both architectures, `lipo`s them into one universal binary,
+      # then bundles + signs the .app and .dmg — see xtask/src/main.rs.
+      # Ad-hoc signing needs no secrets at all; every one of these is only
+      # read when actually present, and `cargo-packager` itself falls back
+      # to ad-hoc / skips notarization with a warning (not a failure) when
+      # they're absent — see Cargo.toml's `[package.metadata.packager]` and
+      # `context-password-project/development/apple-signing-setup.md` for
+      # how a real Apple Developer account configures these.
+      - name: Build everything
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PROFILE: ${{ secrets.APPLE_KEYCHAIN_PROFILE }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+        run: cargo bundle
+
+      - name: Collect artifacts
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          mkdir -p release
+
+          dmg="target/packager/Context Password_${version}_universal.dmg"
+          if [ ! -f "$dmg" ]; then
+            echo "::error::expected DMG not found: $dmg" >&2
+            exit 1
+          fi
+          cp "$dmg" "release/ContextPassword-${version}-universal.dmg"
+
+          cd release
+          shasum -a 256 ./*.dmg | sed 's|\./||' > checksums.txt
+          ls -lh
+          cat checksums.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: context-password-${{ needs.meta.outputs.version }}-macos
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Only this job actually creates the GitHub Release, once both platforms'
+  # artifacts exist — avoids either platform job racing to publish, or
+  # publishing a release that's missing whichever platform failed.
+  publish:
+    needs: [meta, release-windows, release-macos]
+    if: needs.meta.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: context-password-${{ needs.meta.outputs.version }}-windows-x64
+          path: release/windows
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: context-password-${{ needs.meta.outputs.version }}-macos
+          path: release/macos
+
+      # Both platform jobs upload their own `checksums.txt` — merge rather
+      # than let one silently clobber the other when flattened together.
+      - name: Combine artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release/combined
+          cp release/windows/*.exe release/windows/*.msi release/combined/
+          cp release/macos/*.dmg release/combined/
+          cat release/windows/checksums.txt release/macos/checksums.txt > release/combined/checksums.txt
+          ls -lh release/combined
+          cat release/combined/checksums.txt
+
+      - name: Assemble release notes
+        run: |
+          set -euo pipefail
+          bash .github/scripts/release-notes.sh "${{ needs.meta.outputs.version }}" > notes.md
+          echo "--- release notes ---"
+          cat notes.md
+
       - name: Publish the release
-        if: steps.meta.outputs.release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          name: Context Password for Bitwarden ${{ steps.meta.outputs.version }}
+          name: Context Password for Bitwarden ${{ needs.meta.outputs.version }}
           body_path: notes.md
-          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
           fail_on_unmatched_files: true
           files: |
-            release/ContextPassword-${{ steps.meta.outputs.version }}-x64-setup.exe
-            release/ContextPassword-${{ steps.meta.outputs.version }}-x64-portable.exe
-            release/ContextPassword-${{ steps.meta.outputs.version }}-x64.msi
-            release/checksums.txt
+            release/combined/ContextPassword-${{ needs.meta.outputs.version }}-x64-setup.exe
+            release/combined/ContextPassword-${{ needs.meta.outputs.version }}-x64-portable.exe
+            release/combined/ContextPassword-${{ needs.meta.outputs.version }}-x64.msi
+            release/combined/ContextPassword-${{ needs.meta.outputs.version }}-universal.dmg
+            release/combined/checksums.txt

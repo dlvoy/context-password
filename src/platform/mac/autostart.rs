@@ -6,11 +6,10 @@
 //! with a signature/bundle error, surfaced here as a clear message rather
 //! than a confusing OS error code.
 //!
-//! There is no macOS packaging yet (`packaging/` is NSIS-only), so today
-//! `is_available()` is always `false` on this platform and the Settings
-//! checkbox stays disabled with a note explaining why — see
-//! `mac_ui::settings`. This module still does the right thing the moment
-//! packaging exists, with no further changes needed here.
+//! `is_available()` is `true` once running from a real `cargo-packager`
+//! `.app` bundle, `false` for the raw dev binary — in which case the
+//! Settings checkbox stays disabled with a note explaining why, see
+//! `mac_ui::settings`.
 
 use objc2_foundation::NSBundle;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};

@@ -218,7 +218,7 @@ impl SettingsWindow {
         *self.hotkey_spec.borrow_mut() = hotkey.spec();
         self.hotkey_label.setStringValue(&NSString::from_str(&hotkey.spec()));
         // Greyed out with the reason baked into its own title when running
-        // unbundled (always, today — there is no macOS packaging yet):
+        // unbundled (the raw dev binary, not a `cargo-packager` `.app`):
         // `SMAppService` can never report `Enabled` from a bare binary, so
         // offering a live checkbox here just relearns that the hard way on
         // every Save. See `platform::mac::autostart::is_available`.

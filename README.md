@@ -1,8 +1,8 @@
 # Context Password for Bitwarden
 
-Press a hotkey anywhere on Windows, pick a Bitwarden item from a small popup, and its password
-(or username, or one-time code) is typed straight into whatever you were doing. Nothing touches
-the clipboard.
+Press a hotkey anywhere on Windows or macOS, pick a Bitwarden item from a small popup, and its
+password (or username, or one-time code) is typed straight into whatever you were doing. Nothing
+touches the clipboard.
 
 ## What it does
 
@@ -20,6 +20,8 @@ the clipboard.
 Download the latest release from the
 [releases page](https://github.com/dlvoy/context-password/releases/latest).
 
+### Windows
+
 | File | Use |
 | --- | --- |
 | `ContextPassword-<version>-x64-setup.exe` | NSIS installer. Adds a Start Menu entry and an uninstaller. |
@@ -34,6 +36,35 @@ These builds are unsigned, so Windows SmartScreen warns on first run. Choose **M
 ```
 certutil -hashfile <file> SHA256
 ```
+
+### macOS
+
+| File | Use |
+| --- | --- |
+| `ContextPassword-<version>-universal.dmg` | Disk image — open it, then drag Context Password into Applications. Runs on both Apple Silicon and Intel. |
+
+Requires macOS 13 (Ventura) or later.
+
+This build is signed ad-hoc, not notarized — Gatekeeper will warn or refuse to open it on first
+launch, since ad-hoc signing alone doesn't satisfy its "identified developer" check. Right-click
+(or Control-click) the app and choose **Open**, then **Open** again in the dialog; this is needed
+only the first time. If that doesn't clear it, remove the quarantine flag directly:
+
+```
+xattr -dr com.apple.quarantine "Context Password.app"
+```
+
+To verify a download against the release's `checksums.txt`:
+
+```
+shasum -a 256 -c checksums.txt
+```
+
+The first time the app runs, macOS will ask for the **Accessibility** permission (System Settings
+→ Privacy & Security → Accessibility) — required to type into other applications; without it,
+delivery is blocked and the popup says so. If a password field elsewhere currently has **Secure
+Input** active (another app's own password field, mid-edit), typing into it is blocked by macOS
+itself regardless of Accessibility — the popup flags this too, rather than silently doing nothing.
 
 ## Setting up Bitwarden
 
@@ -104,8 +135,9 @@ error.
   - `Up`/`Down`/`Home`/`End`: move the selection without acting on it.
   - `Escape`: dismiss the popup.
 - **Tray icon**: Show (or Unlock, before the vault has been unlocked), Lock, Settings, About, Quit.
-- **Settings**: change the hotkey, toggle "Start with Windows", auto-unlock at startup, lock on
-  exit, and how many items the popup shows at once.
+- **Settings**: switch vault provider (Bitwarden or KeePass), change the hotkey, toggle "Start
+  with Windows" (or "Open at Login" on macOS — only available from the packaged `.app`, not a raw
+  build), auto-unlock at startup, lock on exit, and how many items the popup shows at once.
 
 ## Licence
 
