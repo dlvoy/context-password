@@ -161,6 +161,22 @@ jobs:
   release-macos:
     needs: meta
     runs-on: macos-15
+    # Disabled for now, kept in place rather than deleted: `cargo packager`'s
+    # `--config <json>` flag (used by xtask to override the ad-hoc signing
+    # identity when APPLE_SIGNING_IDENTITY is set) turns out to *replace*
+    # the whole config rather than merge with `[package.metadata.packager]`
+    # in Cargo.toml — confirmed by reading `crates/packager/src/cli/config.rs`
+    # upstream (`detect_configs`: a raw JSON `--config` short-circuits
+    # straight to `serde_json::from_str::<Config>`, never touching the
+    # Cargo.toml-derived config at all). Also, `${{ secrets.X }}` evaluates
+    # to an *empty string*, not unset, when a secret doesn't exist — so this
+    # override was firing unconditionally even with no signing secrets
+    # configured, silently discarding `binaries`/`out-dir` and breaking
+    # every build, not just real-signing ones. Needs `xtask` to build the
+    # whole packager config itself (as JSON, always passed via `--config`,
+    # so there's a single source of truth and no merge ambiguity) before
+    # this can come back on. Flip this back to `true` once that's done.
+    if: false
     steps:
       - uses: actions/checkout@v4
 
@@ -232,12 +248,21 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Only this job actually creates the GitHub Release, once both platforms'
-  # artifacts exist — avoids either platform job racing to publish, or
-  # publishing a release that's missing whichever platform failed.
+  # Only this job actually creates the GitHub Release, once whichever
+  # platform jobs are enabled have finished — avoids either platform job
+  # racing to publish, or publishing a release that's missing a platform
+  # that failed. Deliberately tolerant of `release-macos` being disabled
+  # (see that job's `if: false`) or absent from a future platform matrix:
+  # `always()` bypasses the default "skip if a dependency skipped" cascade,
+  # and every step below adapts to whichever artifact sets actually exist
+  # rather than assuming both are always present.
   publish:
     needs: [meta, release-windows, release-macos]
-    if: needs.meta.outputs.release == 'true'
+    if: |
+      always() &&
+      needs.meta.outputs.release == 'true' &&
+      needs.release-windows.result == 'success' &&
+      needs.release-macos.result != 'failure'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -249,6 +274,7 @@ jobs:
           path: release/windows
 
       - name: Download macOS artifacts
+        if: needs.release-macos.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: context-password-${{ needs.meta.outputs.version }}-macos
@@ -256,13 +282,29 @@ jobs:
 
       # Both platform jobs upload their own `checksums.txt` — merge rather
       # than let one silently clobber the other when flattened together.
+      # Copies whatever each platform's `release/<os>` directory actually
+      # contains rather than a hardcoded file list, so this doesn't need
+      # editing every time a platform is temporarily disabled or a new one
+      # is added.
       - name: Combine artifacts
         run: |
           set -euo pipefail
+          shopt -s nullglob
           mkdir -p release/combined
-          cp release/windows/*.exe release/windows/*.msi release/combined/
-          cp release/macos/*.dmg release/combined/
-          cat release/windows/checksums.txt release/macos/checksums.txt > release/combined/checksums.txt
+          checksum_files=()
+          for os_dir in release/windows release/macos; do
+            [ -d "$os_dir" ] || continue
+            for f in "$os_dir"/*; do
+              [ "$(basename "$f")" = "checksums.txt" ] && continue
+              cp "$f" release/combined/
+            done
+            [ -f "$os_dir/checksums.txt" ] && checksum_files+=("$os_dir/checksums.txt")
+          done
+          if [ "${#checksum_files[@]}" -eq 0 ]; then
+            echo "::error::no checksums.txt found in any platform artifact set" >&2
+            exit 1
+          fi
+          cat "${checksum_files[@]}" > release/combined/checksums.txt
           ls -lh release/combined
           cat release/combined/checksums.txt
 
@@ -280,9 +322,4 @@ jobs:
           body_path: notes.md
           prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
           fail_on_unmatched_files: true
-          files: |
-            release/combined/ContextPassword-${{ needs.meta.outputs.version }}-x64-setup.exe
-            release/combined/ContextPassword-${{ needs.meta.outputs.version }}-x64-portable.exe
-            release/combined/ContextPassword-${{ needs.meta.outputs.version }}-x64.msi
-            release/combined/ContextPassword-${{ needs.meta.outputs.version }}-universal.dmg
-            release/combined/checksums.txt
+          files: release/combined/*
