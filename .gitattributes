@@ -1,0 +1,13 @@
+# Without this, a checkout on a machine with `core.autocrlf=true` (the
+# common default on Windows, including GitHub's own `windows-latest`
+# runner) silently rewrites any LF byte it thinks looks like a text file's
+# line ending into CRLF — corrupting these binary formats byte-for-byte.
+# Found via a real CI failure: the KDBX test fixtures decrypted to garbled,
+# partial data on Windows only (`tests/fixtures/*.kdbx`), never on macOS or
+# on this development machine, because nothing here ever exercised a fresh
+# Windows checkout until CI actually ran one.
+*.kdbx binary
+*.key binary
+*.icns binary
+*.ico binary
+*.rgba binary
