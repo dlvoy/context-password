@@ -97,14 +97,16 @@ impl Config {
         self.max_visible_items.clamp(MIN_VISIBLE_ITEMS, MAX_VISIBLE_ITEMS) as usize
     }
 
-    /// `Err` with a user-facing reason when the current provider isn't
-    /// usable yet — today that's only "KeePass selected but no database
-    /// chosen". Used both by Settings validation (refuse to save) and the
-    /// worker's own guard (`keepass::unlock_and_list` returns the same
-    /// message independently, since a config file could be hand-edited
-    /// into this state without ever going through Settings).
-    pub fn provider_ready(&self) -> Result<(), String> {
-        if self.provider == Provider::KeePass && self.keepass_path.trim().is_empty() {
+    /// `Err` with a user-facing reason when the given provider selection
+    /// isn't usable yet — today that's only "KeePass selected but no
+    /// database chosen". Takes the fields directly rather than `&self` so
+    /// both Settings' not-yet-saved draft and the real `Config` share this
+    /// exact check and message — `keepass::unlock_and_list` returns the
+    /// same message independently (a config file could be hand-edited into
+    /// this state without ever going through Settings), since it only has
+    /// the path string, not a `Config` to call this on.
+    pub fn provider_ready(provider: Provider, keepass_path: &str) -> Result<(), String> {
+        if provider == Provider::KeePass && keepass_path.trim().is_empty() {
             return Err("No KeePass database selected — pick one in Settings.".to_string());
         }
         Ok(())
@@ -210,18 +212,9 @@ mod tests {
 
     #[test]
     fn provider_ready_requires_a_keepass_path_only_for_the_keepass_provider() {
-        let bw = Config { provider: Provider::Bitwarden, keepass_path: String::new(), ..Config::default() };
-        assert!(bw.provider_ready().is_ok());
-
-        let kp_unset = Config { provider: Provider::KeePass, keepass_path: String::new(), ..Config::default() };
-        assert!(kp_unset.provider_ready().is_err());
-
-        let kp_set = Config {
-            provider: Provider::KeePass,
-            keepass_path: "/tmp/whatever.kdbx".to_string(),
-            ..Config::default()
-        };
-        assert!(kp_set.provider_ready().is_ok());
+        assert!(Config::provider_ready(Provider::Bitwarden, "").is_ok());
+        assert!(Config::provider_ready(Provider::KeePass, "").is_err());
+        assert!(Config::provider_ready(Provider::KeePass, "/tmp/whatever.kdbx").is_ok());
     }
 
     #[test]

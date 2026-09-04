@@ -60,6 +60,14 @@ impl Hotkey {
     /// *currently* registered, unless that registration is out of the way
     /// while recording. Call `resume` when recording ends without saving a
     /// change, so the app is never left with no hotkey active.
+    ///
+    /// Only `app.rs` (Windows) calls this — `mac_ui`'s Settings has no
+    /// in-app hotkey recorder yet (`mac_ui::settings`'s own module doc
+    /// covers why: it needs a `block2`-based local `NSEvent` monitor,
+    /// deliberately deferred). `resume` below has no such gap: `mac_ui`
+    /// already calls it defensively in a couple of places, ready for
+    /// whenever a recorder lands.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn suspend(&self) {
         let _ = self.manager.unregister(self.current);
     }

@@ -50,21 +50,25 @@ pub const OS_TAGS: [&str; 5] = ["win", "mac", "linux", "android", "ios"];
 /// to be detected ahead of time (at hotkey-capture time, into
 /// `focus::Target::blocked`) and surfaced as a warning, rather than
 /// discovered after a delivery attempt that quietly did nothing.
-// `NoAccessibility`/`SecureInput` are only ever constructed by the macOS
-// backend (not yet written) — `cfg_attr` rather than a blanket allow so the
-// warning comes back on its own once that backend exists.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// Each variant is only ever constructed by one platform's backend —
+// `Elevated` by Windows, `NoAccessibility`/`SecureInput` by macOS — so each
+// is legitimately dead code on the other target. Per-variant `cfg_attr`
+// rather than one blanket allow on the whole enum, so a warning still comes
+// back if a *new* variant is ever added and genuinely goes unused on both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockReason {
     /// Windows: the target's process runs at a higher UIPI integrity level
     /// than ours, so `SendInput` targeting it is silently dropped. See
     /// `win::integrity`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Elevated,
     /// macOS: the Accessibility permission hasn't been granted, so
     /// `CGEventPost` has no effect outside our own process.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     NoAccessibility,
     /// macOS: the focused field holds Secure Event Input
     /// (`IsSecureEventInputEnabled`), which blocks synthetic keystrokes
     /// into it regardless of Accessibility.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     SecureInput,
 }

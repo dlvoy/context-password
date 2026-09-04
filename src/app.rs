@@ -1081,11 +1081,9 @@ impl App {
         // than applying the other fields and only complaining about this
         // one) — there's no such thing as a partially-valid provider
         // selection.
+        Config::provider_ready(state.provider, &state.keepass_path)?;
         if state.provider == Provider::KeePass {
             let path = state.keepass_path.trim();
-            if path.is_empty() {
-                return Err("No KeePass database selected — pick one in Settings.".to_string());
-            }
             if !std::path::Path::new(path).is_file() {
                 return Err(format!("KeePass database not found: {path}"));
             }

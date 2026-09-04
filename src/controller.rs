@@ -5,10 +5,16 @@
 //! **Scope note:** `VaultState`, `ExitState`, `DeliveryPhase`/`Delivery`,
 //! and `IndicatorPhase`/`next_indicator_phase` are genuinely OS-agnostic —
 //! none of them reference `egui` or a Windows type, so they're built
-//! unconditionally and `src/mac_ui/` (port plan Phase 5) uses them
-//! directly, not a parallel reimplementation. `Content`, `DeliveryKind`,
-//! and the digit-selection functions are still `egui`/`ui::config_window`-
-//! shaped, so they stay `#[cfg(windows)]`. macOS doesn't need an
+//! unconditionally. `VaultState`/`DeliveryPhase`/`Delivery`/`IndicatorPhase`
+//! are used directly by `src/mac_ui/`, not a parallel reimplementation;
+//! `ExitState` is the one exception — `mac_ui`'s lock-on-exit is a
+//! deliberately simpler fire-and-forget send with no waiting state (see
+//! `mac_ui::app_delegate`'s `Msg::Tray(TrayCmd::Quit)` handler), so this
+//! type is Windows-`app.rs`-only in practice, kept unconditional here only
+//! because nothing about its definition is actually Windows-specific.
+//! `Content`, `DeliveryKind`, and the digit-selection functions are still
+//! `egui`/`ui::config_window`-shaped, so they stay `#[cfg(windows)]`. macOS
+//! doesn't need an
 //! equivalent of `Content::Settings`/`Content::About`: those exist only
 //! because Windows folds every screen into one `eframe` viewport (working
 //! around an eframe/glow bug — see `Content::Settings`'s old doc in
@@ -43,6 +49,9 @@ pub enum VaultState {
 /// asked once" state survives across frames without re-deriving it from
 /// `vault_state`, which also changes for unrelated reasons (the tray's own
 /// Lock item).
+// Only `app.rs` (Windows) actually uses this — see the module doc's scope
+// note for why it's `mac_ui`'s one exception to reusing these shared types.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ExitState {
     NotExiting,

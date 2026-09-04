@@ -1234,11 +1234,9 @@ fn apply_settings(state: &mut AppState, draft: &settings::Draft) -> Result<(), S
     // Validated first, and refuses the whole save on failure (rather than
     // applying the other fields and only complaining about this one) —
     // there's no such thing as a partially-valid provider selection.
+    Config::provider_ready(draft.provider, &draft.keepass_path)?;
     if draft.provider == Provider::KeePass {
         let path = draft.keepass_path.trim();
-        if path.is_empty() {
-            return Err("No KeePass database selected — pick one in Settings.".to_string());
-        }
         if !std::path::Path::new(path).is_file() {
             return Err(format!("KeePass database not found: {path}"));
         }

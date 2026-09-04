@@ -21,7 +21,11 @@ const VALUE_NAME: &str = "context-password";
 /// Always available on Windows — any executable can add itself to the Run
 /// key, unlike macOS's `SMAppService`, which needs a real `.app` bundle.
 /// Exists so `mac_ui::settings` can gate the checkbox through one
-/// `platform::autostart::is_available()` call on either target.
+/// `platform::autostart::is_available()` call on either target — Windows'
+/// own Settings UI has no equivalent gate to call this from (the checkbox
+/// there is unconditionally enabled), so this is legitimately unused on a
+/// Windows build specifically.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn is_available() -> bool {
     true
 }

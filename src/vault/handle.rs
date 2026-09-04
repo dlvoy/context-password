@@ -95,10 +95,6 @@ impl VaultHandle {
         self.spawned_with.provider
     }
 
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
     /// Whether a `Msg::Vault { generation, .. }` belongs to the *live*
     /// worker — a stale generation means the result is from a worker
     /// already torn down by a provider switch, and must be dropped rather
