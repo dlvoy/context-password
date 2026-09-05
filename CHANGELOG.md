@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS release builds are published again — `release-macos` had been disabled since 1.5.0 after
+  `cargo packager`'s `--config` override turned out to replace its whole config instead of
+  merging it, and to unconditionally pass empty-string Apple secrets that made notarization fail
+  outright instead of falling back to ad-hoc. The DMG remains ad-hoc signed and unnotarized (no
+  Apple Developer Program account); the one-time Gatekeeper unlock is now documented in the
+  README's "Opening it the first time" section and linked from every release's notes. A failed or
+  skipped macOS build no longer blocks the Windows release.
+
 ## [1.5.0] - 2026-09-04
 
 ### Added

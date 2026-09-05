@@ -45,14 +45,11 @@ certutil -hashfile <file> SHA256
 
 Requires macOS 13 (Ventura) or later.
 
-This build is signed ad-hoc, not notarized — Gatekeeper will warn or refuse to open it on first
-launch, since ad-hoc signing alone doesn't satisfy its "identified developer" check. Right-click
-(or Control-click) the app and choose **Open**, then **Open** again in the dialog; this is needed
-only the first time. If that doesn't clear it, remove the quarantine flag directly:
-
-```
-xattr -dr com.apple.quarantine "Context Password.app"
-```
+This build is signed ad-hoc, not notarized — there's no Apple Developer Program membership behind
+this project, so Gatekeeper's "identified developer" check fails by design and it blocks the app on
+first launch. See [Opening it the first time](#opening-it-the-first-time) below for the one-time
+steps to allow it; this doesn't repeat on later launches of the same copy, though it does for each
+new version you download.
 
 To verify a download against the release's `checksums.txt`:
 
@@ -60,11 +57,35 @@ To verify a download against the release's `checksums.txt`:
 shasum -a 256 -c checksums.txt
 ```
 
+#### Opening it the first time
+
+Because the build is ad-hoc signed rather than notarized, Gatekeeper blocks it outright — a plain
+double-click says the app "is damaged" or "cannot be opened" (a misleading message; nothing is
+actually wrong with it). Which workaround applies depends on your macOS version:
+
+**macOS 15 (Sequoia) and later:** double-click the app, dismiss the warning dialog, then go to
+System Settings → **Privacy & Security**, scroll to the Security section, and click **Open
+Anyway** next to the mention of Context Password. Confirm with your password or Touch ID, then
+**Open Anyway** once more in the dialog that follows.
+
+**macOS 13–14 (Ventura/Sonoma):** right-click (or Control-click) the app in Applications and choose
+**Open**, then **Open** again in the dialog. Right-clicking still works on later versions too, but
+no longer clears Gatekeeper's block on its own the way it used to.
+
+**Either version, from the Terminal:** remove the quarantine flag directly, which skips both
+dialogs:
+
+```
+xattr -dr com.apple.quarantine "/Applications/Context Password.app"
+```
+
 The first time the app runs, macOS will ask for the **Accessibility** permission (System Settings
 → Privacy & Security → Accessibility) — required to type into other applications; without it,
-delivery is blocked and the popup says so. If a password field elsewhere currently has **Secure
-Input** active (another app's own password field, mid-edit), typing into it is blocked by macOS
-itself regardless of Accessibility — the popup flags this too, rather than silently doing nothing.
+delivery is blocked and the popup says so. **Secure Input** is a separate, session-wide macOS flag
+— when any app currently has a password field mid-edit (or otherwise turns it on), synthetic
+keystrokes are blocked into *every* app on the system, not just that one, regardless of
+Accessibility. The popup flags this too, naming the app holding it when it can, rather than
+silently doing nothing.
 
 ## Setting up Bitwarden
 

@@ -161,22 +161,14 @@ jobs:
   release-macos:
     needs: meta
     runs-on: macos-15
-    # Disabled for now, kept in place rather than deleted: `cargo packager`'s
-    # `--config <json>` flag (used by xtask to override the ad-hoc signing
-    # identity when APPLE_SIGNING_IDENTITY is set) turns out to *replace*
-    # the whole config rather than merge with `[package.metadata.packager]`
-    # in Cargo.toml — confirmed by reading `crates/packager/src/cli/config.rs`
-    # upstream (`detect_configs`: a raw JSON `--config` short-circuits
-    # straight to `serde_json::from_str::<Config>`, never touching the
-    # Cargo.toml-derived config at all). Also, `${{ secrets.X }}` evaluates
-    # to an *empty string*, not unset, when a secret doesn't exist — so this
-    # override was firing unconditionally even with no signing secrets
-    # configured, silently discarding `binaries`/`out-dir` and breaking
-    # every build, not just real-signing ones. Needs `xtask` to build the
-    # whole packager config itself (as JSON, always passed via `--config`,
-    # so there's a single source of truth and no merge ambiguity) before
-    # this can come back on. Flip this back to `true` once that's done.
-    if: false
+    # Signs ad-hoc only (`signing-identity = "-"` in Cargo.toml) — no Apple
+    # Developer Program account, no secrets, and deliberately no Apple env
+    # vars below (see the "Build everything" step). Ad-hoc + unnotarized
+    # means Gatekeeper blocks the DMG's app on first launch; the README's
+    # "Opening it the first time" section and the release notes below are
+    # the documented workaround, not a bug to fix here. Real Developer ID
+    # signing is a separate, opt-in path — see
+    # `context-password-project/development/apple-signing-setup.md`.
     steps:
       - uses: actions/checkout@v4
 
@@ -199,24 +191,21 @@ jobs:
 
       # Builds both architectures, `lipo`s them into one universal binary,
       # then bundles + signs the .app and .dmg — see xtask/src/main.rs.
-      # Ad-hoc signing needs no secrets at all; every one of these is only
-      # read when actually present, and `cargo-packager` itself falls back
-      # to ad-hoc / skips notarization with a warning (not a failure) when
-      # they're absent — see Cargo.toml's `[package.metadata.packager]` and
-      # `context-password-project/development/apple-signing-setup.md` for
-      # how a real Apple Developer account configures these.
+      # Ad-hoc signing (Cargo.toml's `signing-identity = "-"`) needs no
+      # secrets at all, so deliberately no `env:` block here. `cargo
+      # packager` reads its Apple env vars with `std::env::var_os`, which
+      # can't distinguish "unset" from "set to empty string" — and
+      # `${{ secrets.X }}` evaluates to an *empty string*, not unset, when a
+      # secret doesn't exist. So listing APPLE_CERTIFICATE/
+      # APPLE_KEYCHAIN_PROFILE/etc. here unconditionally, even with no
+      # signing secrets configured, made `cargo packager` try to import an
+      # empty certificate and treat notarization as configured-but-failing —
+      # a hard build error, not the graceful "skip with a warning" path that
+      # only fires when these vars are genuinely absent. Real Developer ID
+      # signing needs its own `env:` block naming only the secrets that
+      # actually exist — see
+      # `context-password-project/development/apple-signing-setup.md`.
       - name: Build everything
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_KEYCHAIN_PROFILE: ${{ secrets.APPLE_KEYCHAIN_PROFILE }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
         run: cargo bundle
 
       - name: Collect artifacts
@@ -249,20 +238,21 @@ jobs:
           retention-days: 14
 
   # Only this job actually creates the GitHub Release, once whichever
-  # platform jobs are enabled have finished — avoids either platform job
-  # racing to publish, or publishing a release that's missing a platform
-  # that failed. Deliberately tolerant of `release-macos` being disabled
-  # (see that job's `if: false`) or absent from a future platform matrix:
-  # `always()` bypasses the default "skip if a dependency skipped" cascade,
-  # and every step below adapts to whichever artifact sets actually exist
+  # platform jobs are enabled have finished. `release-macos` is deliberately
+  # NOT required to succeed: it packages a DMG via a third-party `create-dmg`
+  # script downloaded at build time and drives Finder through AppleScript,
+  # both of which can flake on a hosted runner in ways unrelated to whether
+  # the app itself is fine — a release shouldn't fail to ship Windows users
+  # a working build over that. `always()` bypasses the default "skip if a
+  # dependency skipped/failed" cascade, and every step below (and
+  # release-notes.sh) adapts to whichever artifact sets actually exist
   # rather than assuming both are always present.
   publish:
     needs: [meta, release-windows, release-macos]
     if: |
       always() &&
       needs.meta.outputs.release == 'true' &&
-      needs.release-windows.result == 'success' &&
-      needs.release-macos.result != 'failure'
+      needs.release-windows.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -311,7 +301,7 @@ jobs:
       - name: Assemble release notes
         run: |
           set -euo pipefail
-          bash .github/scripts/release-notes.sh "${{ needs.meta.outputs.version }}" > notes.md
+          bash .github/scripts/release-notes.sh "${{ needs.meta.outputs.version }}" release/combined > notes.md
           echo "--- release notes ---"
           cat notes.md
 

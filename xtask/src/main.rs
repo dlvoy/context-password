@@ -124,24 +124,22 @@ fn run_macos(root: &Path, version: &str) -> ExitCode {
         return code;
     }
 
-    let mut packager_args = vec!["packager".to_string(), "--release".to_string()];
-    if let Ok(identity) = std::env::var("APPLE_SIGNING_IDENTITY") {
-        // Real Developer ID signing overrides the ad-hoc default in
-        // Cargo.toml. `signing-identity` is a plain config value, not
-        // itself env-driven, so `--config <json>` (documented as accepting
-        // a raw JSON string merged over the base config) is the supported
-        // way to override it per-invocation. Everything else — importing
-        // the certificate from `APPLE_CERTIFICATE`/`APPLE_CERTIFICATE_PASSWORD`,
-        // attempting notarization from whichever of `APPLE_KEYCHAIN_PROFILE`
-        // / `APPLE_ID`+`APPLE_PASSWORD`+`APPLE_TEAM_ID` /
-        // `APPLE_API_KEY`+`APPLE_API_ISSUER`+`APPLE_API_KEY_PATH` is
-        // present — `cargo packager` already reads directly from the
-        // environment on its own; nothing else to wire here. See
-        // `context-password-project/development/apple-signing-setup.md`
-        // for how a real account configures all of these.
-        packager_args.push("--config".to_string());
-        packager_args.push(format!(r#"{{"macos":{{"signingIdentity":"{identity}"}}}}"#));
-    }
+    // No `--config` override here, deliberately. `cargo packager`'s
+    // `--config <json>` *replaces* the whole config rather than merging it
+    // with `[package.metadata.packager]` in Cargo.toml (confirmed by reading
+    // `crates/packager/src/cli/config.rs` upstream: a raw JSON `--config`
+    // short-circuits straight to `serde_json::from_str::<Config>`, never
+    // touching the Cargo.toml-derived config at all) — so a per-invocation
+    // override of just `signing-identity` silently drops `binaries`,
+    // `out-dir`, `binaries-dir`, `version`, everything.
+    //
+    // Ad-hoc signing (`signing-identity = "-"` in Cargo.toml) needs no
+    // override at all — no account, no secrets — so this always runs the
+    // plain command. Real Developer ID signing means editing that one
+    // line in Cargo.toml (and setting `APPLE_CERTIFICATE` etc., which
+    // `cargo packager` reads directly from the environment on its own); see
+    // `context-password-project/development/apple-signing-setup.md`.
+    let packager_args = vec!["packager".to_string(), "--release".to_string()];
     if let Err(code) = run_step("Packaging the .app and .dmg", "cargo", &packager_args, root) {
         return code;
     }

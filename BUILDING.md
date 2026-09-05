@@ -163,10 +163,14 @@ cargo check --target aarch64-apple-darwin
 `.github/workflows/release.yml` runs on a pushed `vX.Y.Z` tag (or manually, for a dry run) as four
 jobs: `meta` (works out the version, checks it matches `Cargo.toml`), `release-windows` and
 `release-macos` (test, lint, build, package — independently, in parallel), and `publish` (only on
-an actual tag push — downloads both platforms' artifacts, writes the release notes, and creates
-one GitHub Release covering both). `.github/workflows/ci.yml` runs the test-and-lint half of that
-— matrixed over both platforms — on every push and pull request, so a broken commit is caught
-long before anyone tags a release.
+an actual tag push — downloads whichever platforms' artifacts exist, writes the release notes, and
+creates one GitHub Release). `release-macos` is allowed to fail or be skipped without blocking the
+release — it depends on a third-party `create-dmg` script downloaded at build time and drives
+Finder via AppleScript, either of which can flake on a hosted runner independent of whether the
+app itself built fine — in which case `publish` still ships the Windows artifacts, and
+`release-notes.sh` omits the macOS download row rather than advertising a file that isn't attached.
+`.github/workflows/ci.yml` runs the test-and-lint half of that — matrixed over both platforms — on
+every push and pull request, so a broken commit is caught long before anyone tags a release.
 
 ## Cutting a release
 
@@ -187,16 +191,20 @@ Authenticode certificate (from a CA or an EV token) and a `signtool sign` step a
 release workflow after each installer is built.
 
 **macOS** release builds are signed ad-hoc (`signing-identity = "-"` in `Cargo.toml`) — enough to
-run locally without Gatekeeper's stronger warnings being fully silenced, but a fresh download
-still needs the right-click-to-open workaround the README describes, since ad-hoc signing alone
-doesn't satisfy Gatekeeper's "identified developer" check. `release-macos` in `release.yml` also
-reads `APPLE_CERTIFICATE`/`APPLE_CERTIFICATE_PASSWORD`/`APPLE_SIGNING_IDENTITY` and notarization
-credentials (`APPLE_KEYCHAIN_PROFILE`, or `APPLE_ID`+`APPLE_PASSWORD`+`APPLE_TEAM_ID`, or an App
-Store Connect API key) from repository secrets — when present, `cargo-packager` signs with the
-real Developer ID identity and notarizes automatically; when absent (the default today), it falls
-back to ad-hoc and skips notarization with a warning, not a failure. Configuring a real Apple
-Developer ID account for this is documented separately, outside this repo:
-`context-password-project/development/apple-signing-setup.md`.
+run locally and to launch at all (an unsigned universal binary won't launch on Apple Silicon), but
+a fresh download still needs the one-time unlock the README's
+[Opening it the first time](README.md#opening-it-the-first-time) section describes, since ad-hoc
+signing alone doesn't satisfy Gatekeeper's "identified developer" check. `release.yml` passes no
+Apple secrets to `release-macos` at all, and `xtask` passes no `--config` override to
+`cargo packager` either — real Developer ID signing needs both a `Cargo.toml` change (setting
+`signing-identity` to the actual identity string; there's no env-var override for it, since
+`cargo packager`'s `--config <json>` flag replaces the whole config rather than merging with
+`[package.metadata.packager]`) and a matching `env:` block added back to `release-macos` naming
+only the secrets actually configured — listing `APPLE_CERTIFICATE`/`APPLE_KEYCHAIN_PROFILE`/etc.
+unconditionally is what broke this before (GitHub Actions expands an unset secret to an *empty
+string*, and `cargo packager` can't tell that apart from a real one, so it fails instead of falling
+back to ad-hoc). Configuring a real Apple Developer ID account for this is documented separately,
+outside this repo: `context-password-project/development/apple-signing-setup.md`.
 
 ## macOS: keeping the Accessibility grant across rebuilds
 
@@ -243,4 +251,4 @@ entry can otherwise mask whether the fix took effect.
 | (macOS) Accessibility looks granted but delivery still fails with `NoAccessibility` | Debug builds are unsigned, so each rebuild is a new identity to TCC — see [macOS: keeping the Accessibility grant across rebuilds](#macos-keeping-the-accessibility-grant-across-rebuilds). Packaged `.app` builds don't have this problem. |
 | (macOS) `cargo packager` fails immediately | It isn't installed — `cargo install cargo-packager --locked`. |
 | (macOS) `cargo bundle` fails at the `lipo` step | One of the two `rustup target add` targets (`aarch64-apple-darwin`, `x86_64-apple-darwin`) is missing. |
-| (macOS) The downloaded `.dmg`'s app won't open from a double-click (Gatekeeper warns or refuses) | Expected for an ad-hoc-signed, unnotarized build — confirmed with `spctl -a -vv`, which reports `rejected` for exactly this reason. Right-click (Control-click) the app and choose **Open**, then **Open** again in the dialog; if that doesn't clear it, `xattr -dr com.apple.quarantine "Context Password.app"` removes the flag Gatekeeper is reacting to. |
+| (macOS) The downloaded `.dmg`'s app won't open from a double-click (Gatekeeper warns or refuses) | Expected for an ad-hoc-signed, unnotarized build — confirmed with `spctl -a -vv`, which reports `rejected` for exactly this reason. See the README's [Opening it the first time](README.md#opening-it-the-first-time): System Settings → Privacy & Security → **Open Anyway** on macOS 15+, right-click → **Open** on macOS 13–14, or `xattr -dr com.apple.quarantine "Context Password.app"` on either. |
