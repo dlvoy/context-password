@@ -188,9 +188,13 @@ pub fn showing_list(
                     "Accessibility permission not granted — typing would be blocked. Enter will \
                      abort."
                 }
+                // Unreachable in practice — `SecureInput` is only ever
+                // constructed by `platform::mac::permissions`, so this
+                // front end never sees it. Kept in sync with the macOS
+                // wording (`mac_ui::app_delegate::blocked_text`) anyway, so
+                // the two don't drift if that ever changes.
                 BlockReason::SecureInput => {
-                    "Target field has secure input active — typing would be blocked. Enter will \
-                     abort."
+                    "Secure input active system-wide — typing would be blocked. Enter will abort."
                 }
             };
             ui.colored_label(WARNING_COLOR, text);

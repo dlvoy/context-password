@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-05
+
 ### Fixed
 
 - macOS release builds are published again — `release-macos` had been disabled since 1.5.0 after
@@ -16,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Apple Developer Program account); the one-time Gatekeeper unlock is now documented in the
   README's "Opening it the first time" section and linked from every release's notes. A failed or
   skipped macOS build no longer blocks the Windows release.
+- On macOS, the popup's secure-input warning now names the app currently holding it instead of
+  vaguely blaming "the target field" — Secure Input is a session-wide flag, not scoped to any one
+  field — and is re-checked right before typing instead of relying on a stale check from when the
+  popup opened, so a warning that already cleared no longer blocks Enter for no visible reason.
+- Selected rows in the macOS popup no longer wash out their delivery icon and number badge against
+  the blue selection highlight.
 
 ## [1.5.0] - 2026-09-04
 

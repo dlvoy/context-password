@@ -137,6 +137,7 @@ impl ListCard {
 // Windows source, not re-derived.
 struct RowIconIvars {
     mode: Cell<DeliveryKind>,
+    selected: Cell<bool>,
 }
 
 define_class!(
@@ -150,7 +151,12 @@ define_class!(
     impl RowIcon {
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty_rect: NSRect) {
-            draw_icon(self.bounds().size, self.ivars().mode.get());
+            let color = if self.ivars().selected.get() {
+                NSColor::alternateSelectedControlTextColor()
+            } else {
+                NSColor::labelColor()
+            };
+            draw_icon(self.bounds().size, self.ivars().mode.get(), &color);
         }
 
         #[unsafe(method(isFlipped))]
@@ -162,7 +168,10 @@ define_class!(
 
 impl RowIcon {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(RowIconIvars { mode: Cell::new(DeliveryKind::Password) });
+        let this = Self::alloc(mtm).set_ivars(RowIconIvars {
+            mode: Cell::new(DeliveryKind::Password),
+            selected: Cell::new(false),
+        });
         unsafe { msg_send![super(this), init] }
     }
 
@@ -175,6 +184,18 @@ impl RowIcon {
             self.setNeedsDisplay(true);
         }
     }
+
+    /// Same no-op-when-unchanged guard as `set_mode`, for the same reason —
+    /// called on every visible row on every `layout()`. Selected rows get a
+    /// light glyph (`alternateSelectedControlTextColor`) instead of
+    /// `labelColor`'s near-black, so the icon stays legible on the blue
+    /// `SelectionBand` behind it.
+    fn set_selected(&self, selected: bool) {
+        if self.ivars().selected.get() != selected {
+            self.ivars().selected.set(selected);
+            self.setNeedsDisplay(true);
+        }
+    }
 }
 
 /// Ported from `ui/popup.rs::paint_icon` — same proportions (`ICON_SIZE`
@@ -184,10 +205,9 @@ impl RowIcon {
 /// convenience for per-corner rounding, and building one by hand isn't
 /// worth it for a ~6×3pt shape where the difference is imperceptible — a
 /// uniformly rounded rect is used instead.
-fn draw_icon(size: NSSize, mode: DeliveryKind) {
+fn draw_icon(size: NSSize, mode: DeliveryKind, color: &NSColor) {
     let s = size.width.min(size.height);
     let center = NSPoint::new(size.width / 2.0, size.height / 2.0);
-    let color = NSColor::labelColor();
     color.setFill();
     color.setStroke();
     match mode {
@@ -249,11 +269,14 @@ fn circle(center: NSPoint, radius: f64) -> Retained<NSBezierPath> {
 }
 
 // The blue quick-select digit badge — ported from `ui/popup.rs::paint_badge`.
-// Unlike `RowIcon`, this never changes after construction: row slot *i*
-// always shows the same digit regardless of which entry currently occupies
-// it, so the digit lives in `set_ivars` directly rather than a `Cell`.
+// Unlike `RowIcon`'s `mode`, `digit` never changes after construction: row
+// slot *i* always shows the same digit regardless of which entry currently
+// occupies it, so it lives in `set_ivars` directly rather than a `Cell`.
+// `selected` does change every time the arrow keys move, so that one *is* a
+// `Cell`, same as `RowIconIvars`.
 struct RowBadgeIvars {
     digit: char,
+    selected: Cell<bool>,
 }
 
 define_class!(
@@ -267,7 +290,7 @@ define_class!(
     impl RowBadge {
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty_rect: NSRect) {
-            draw_badge(self.bounds(), self.ivars().digit);
+            draw_badge(self.bounds(), self.ivars().digit, self.ivars().selected.get());
         }
 
         #[unsafe(method(isFlipped))]
@@ -279,17 +302,34 @@ define_class!(
 
 impl RowBadge {
     fn new(mtm: MainThreadMarker, digit: char) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(RowBadgeIvars { digit });
+        let this = Self::alloc(mtm).set_ivars(RowBadgeIvars { digit, selected: Cell::new(false) });
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// Same no-op-when-unchanged guard as `RowIcon::set_selected`, for the
+    /// same reason — called on every visible row on every `layout()`.
+    fn set_selected(&self, selected: bool) {
+        if self.ivars().selected.get() != selected {
+            self.ivars().selected.set(selected);
+            self.setNeedsDisplay(true);
+        }
     }
 }
 
 /// The exact blue Windows uses (`ui/popup.rs::BADGE_COLOR`) — ported as a
 /// literal, not a semantic system color, for the same reason `ListCard`
 /// and its row text settled on hardcoded white/black: a specific requested
-/// look, not one that should shift with system accent color.
-fn draw_badge(bounds: NSRect, digit: char) {
-    rgb(0x2e, 0x6b, 0xd6).setFill();
+/// look, not one that should shift with system accent color. On a selected
+/// row the blue `SelectionBand` behind it would otherwise swallow the disc
+/// and leave a white digit floating on blue, so the two colors swap instead
+/// of just fading out.
+fn draw_badge(bounds: NSRect, digit: char, selected: bool) {
+    let (fill, text_color) = if selected {
+        (NSColor::whiteColor(), badge_blue())
+    } else {
+        (badge_blue(), NSColor::whiteColor())
+    };
+    fill.setFill();
     NSBezierPath::bezierPathWithOvalInRect(bounds).fill();
 
     let text = NSString::from_str(&digit.to_string());
@@ -299,7 +339,7 @@ fn draw_badge(bounds: NSRect, digit: char) {
     // (the same thing Swift does implicitly for `[.font: font, ...]`).
     let font: Retained<AnyObject> =
         unsafe { Retained::cast_unchecked(NSFont::boldSystemFontOfSize(11.0)) };
-    let color: Retained<AnyObject> = unsafe { Retained::cast_unchecked(NSColor::whiteColor()) };
+    let color: Retained<AnyObject> = unsafe { Retained::cast_unchecked(text_color) };
     let keys: [&NSString; 2] = [unsafe { NSFontAttributeName }, unsafe { NSForegroundColorAttributeName }];
     let values: [&AnyObject; 2] = [&font, &color];
     let attrs = NSDictionary::from_slices(&keys, &values);
@@ -314,6 +354,10 @@ fn draw_badge(bounds: NSRect, digit: char) {
 
 fn rgb(r: u8, g: u8, b: u8) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0, 1.0)
+}
+
+fn badge_blue() -> Retained<NSColor> {
+    rgb(0x2e, 0x6b, 0xd6)
 }
 
 // A digit key (1-9, 0) isn't bound to any `NSResponder` command selector,
@@ -604,6 +648,11 @@ impl Panel {
         stale_label.setTextColor(Some(&NSColor::systemOrangeColor()));
         let blocked_label = label(mtm, "", 11.0, false);
         blocked_label.setTextColor(Some(&NSColor::systemOrangeColor()));
+        // Single line, fixed `LINE_HEIGHT` slot (unlike Settings' wrapped
+        // error label) — the `SecureInput` message now carries a holder app
+        // name of arbitrary length, so this truncates with an ellipsis
+        // instead of clipping mid-glyph or overflowing the row below it.
+        blocked_label.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
         let message_label = label(mtm, "", 11.0, false);
         message_label.setTextColor(Some(&NSColor::systemRedColor()));
 
@@ -836,7 +885,8 @@ impl Panel {
                         button.setTitle(&NSString::from_str(row_text));
                         let row_placement =
                             Placement { view: button, x: text_x, top: y, w: text_w, h: ROW_HEIGHT };
-                        if i == *selected {
+                        let is_selected = i == *selected;
+                        if is_selected {
                             button.setContentTintColor(Some(&NSColor::alternateSelectedControlTextColor()));
                             self.selection_band.setHidden(false);
                             // Deferred into `placements` like everything
@@ -858,10 +908,12 @@ impl Panel {
                         let icon = &self.row_icons[i];
                         icon.setHidden(false);
                         icon.set_mode(mode);
+                        icon.set_selected(is_selected);
                         placements.push(Placement { view: icon, x: icon_x, top: y + icon_top_offset, w: ICON_SIZE, h: ICON_SIZE });
 
                         let badge = &self.row_badges[i];
                         badge.setHidden(false);
+                        badge.set_selected(is_selected);
                         placements.push(Placement { view: badge, x: badge_x, top: y + badge_top_offset, w: BADGE_SIZE, h: BADGE_SIZE });
 
                         y += ROW_HEIGHT;

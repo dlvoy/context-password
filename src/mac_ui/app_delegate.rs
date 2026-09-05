@@ -1064,7 +1064,15 @@ fn advance_delivery(state: &mut AppState) {
         }
         DeliveryPhase::Settle => {
             if Instant::now() >= delivery.deadline {
-                if let Some(reason) = delivery.target.blocked() {
+                // Re-checked now, not `delivery.target.blocked()` — that's
+                // a snapshot from hotkey-press time, and both `BlockReason`
+                // variants that can fire here are transient (Accessibility
+                // can be granted mid-popup, and Secure Input in particular
+                // is a session-wide flag some *other* app flips on and off,
+                // see `platform::mac::permissions`). Aborting on a
+                // condition that already cleared would make Enter refuse to
+                // type for no reason the user could see.
+                if let Some(reason) = platform::permissions::block_reason() {
                     eprintln!("delivery aborted: target can't receive synthetic keystrokes ({reason:?})");
                 } else {
                     let skipped = platform::typing::send_unicode(delivery.secret.expose());
@@ -1216,18 +1224,21 @@ fn blocked_text(state: &AppState) -> Option<String> {
         return None;
     }
     let reason = state.popup_target.and_then(|t| t.blocked())?;
-    Some(
-        match reason {
-            BlockReason::Elevated => "Target runs elevated — typing would be blocked.",
-            BlockReason::NoAccessibility => {
-                "Accessibility permission not granted — typing would be blocked."
-            }
-            BlockReason::SecureInput => {
-                "Target field has secure input active — typing would be blocked."
-            }
+    Some(match reason {
+        BlockReason::Elevated => "Target runs elevated — typing would be blocked.".to_string(),
+        BlockReason::NoAccessibility => {
+            "Accessibility permission not granted — typing would be blocked.".to_string()
         }
-        .to_string(),
-    )
+        // Secure Input is session-wide, not scoped to "the target" (see
+        // `platform::mac::permissions::secure_input_active`'s doc) — named
+        // here when we can resolve who holds it, since "Target field" would
+        // otherwise misdescribe a warning that's really about some other
+        // app entirely.
+        BlockReason::SecureInput => match platform::permissions::secure_input_holder() {
+            Some(holder) => format!("Secure input active in {holder} — typing is blocked."),
+            None => "Secure input active system-wide — typing is blocked.".to_string(),
+        },
+    })
 }
 
 fn apply_settings(state: &mut AppState, draft: &settings::Draft) -> Result<(), String> {
